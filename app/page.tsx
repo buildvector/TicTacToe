@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import {
@@ -30,7 +30,7 @@ function net(lamports: number) {
 }
 
 async function fetchJson(url: string, init?: RequestInit) {
-  const res = await fetch(url, init);
+  const res = await fetch(url, { ...init, cache: "no-store" });
   const text = await res.text();
   let data: any = null;
 
@@ -76,6 +76,10 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
+  // ✅ serverNow ~= Date.now() + serverOffsetMs
+  const [serverOffsetMs, setServerOffsetMs] = useState(0);
+  const syncingRef = useRef(false);
+
   useEffect(() => setMounted(true), []);
 
   const betLamports = useMemo(
@@ -113,6 +117,28 @@ export default function Page() {
     setCustom(String(v));
   };
 
+  const serverNow = () => Date.now() + serverOffsetMs;
+
+  // ✅ Real server time sync (HTTP Date header). Fixes 2s -> 18s jump.
+  async function syncServerClock() {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    try {
+      const res = await fetch("/", { method: "HEAD", cache: "no-store" });
+      const date = res.headers.get("date");
+      if (date) {
+        const serverMs = Date.parse(date);
+        if (Number.isFinite(serverMs)) {
+          setServerOffsetMs(serverMs - Date.now());
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      syncingRef.current = false;
+    }
+  }
+
   const refreshLobby = async () => {
     const j = await fetchJson("/api/game/list");
     setLobby(j.games ?? []);
@@ -128,6 +154,7 @@ export default function Page() {
 
     (async () => {
       try {
+        await syncServerClock();
         await refreshLobby();
         await refreshHistory();
       } catch {}
@@ -136,10 +163,12 @@ export default function Page() {
     const t = setInterval(async () => {
       if (!alive) return;
       try {
+        // re-sync occasionally so countdown stays stable
+        await syncServerClock();
         await refreshLobby();
         await refreshHistory();
       } catch {}
-    }, 1500);
+    }, 10_000);
 
     return () => {
       alive = false;
@@ -147,36 +176,39 @@ export default function Page() {
     };
   }, []);
 
+  // poll current game
   useEffect(() => {
     if (!gameId) return;
     const t = setInterval(async () => {
       try {
-        const j = await fetchJson(
-          `/api/game/get?gameId=${encodeURIComponent(gameId)}`
-        );
+        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
         setGame(j.game);
       } catch {}
     }, 900);
     return () => clearInterval(t);
   }, [gameId]);
 
+  // ✅ countdown uses serverNow()
   useEffect(() => {
-    if (!game?.deadlineAt || game?.status !== "PLAYING") {
+    if (!game || game.status !== "PLAYING" || !game.deadlineAt) {
       setSecondsLeft(0);
       return;
     }
-    const tick = () => {
-      const s = Math.max(
-        0,
-        Math.ceil((Number(game.deadlineAt) - Date.now()) / 1000)
-      );
-      setSecondsLeft(s);
-    };
-    tick();
-    const t = setInterval(tick, 250);
-    return () => clearInterval(t);
-  }, [game?.deadlineAt, game?.status, game?.updatedAt]);
 
+    const tick = () => {
+      const remaining = Math.max(
+        0,
+        Math.ceil((Number(game.deadlineAt) - serverNow()) / 1000)
+      );
+      setSecondsLeft(remaining);
+    };
+
+    tick();
+    const interval = setInterval(tick, 250);
+    return () => clearInterval(interval);
+  }, [game?.deadlineAt, game?.status, game?.updatedAt, serverOffsetMs]);
+
+  // restore session token
   useEffect(() => {
     if (!publicKey || !gameId) return;
     const key = sessionKey(publicKey.toBase58(), gameId);
@@ -230,6 +262,9 @@ export default function Page() {
         j.sessionToken
       );
 
+      // ✅ get fresh server time right after creating
+      await syncServerClock();
+
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -257,6 +292,8 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
+
+      await syncServerClock();
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -287,6 +324,9 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
+      // ✅ sync right after join (prevents weird countdown start)
+      await syncServerClock();
+
       toast.success("Joined game");
     } catch (e: any) {
       toast.dismiss();
@@ -310,6 +350,9 @@ export default function Page() {
       });
 
       setGame(j.game);
+
+      // ✅ keep clock synced after moves (mobile can drift)
+      await syncServerClock();
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
@@ -336,11 +379,7 @@ export default function Page() {
     return current === me;
   }, [game, me]);
 
-  // ✅ make board fit without scrolling:
-  // - smaller card padding on mobile
-  // - board uses clamp() and smaller gap
-  // - cells use variable size instead of aspect-ratio
-  const cellSize = "clamp(72px, 22vw, 110px)"; // tune if you want
+  const cellSize = "clamp(72px, 22vw, 110px)";
 
   return (
     <main className="bg-casino">
@@ -387,9 +426,7 @@ export default function Page() {
             </div>
           </div>
 
-          <div>
-            {mounted ? <WalletMultiButton /> : <div style={{ width: 170, height: 40 }} />}
-          </div>
+          <div>{mounted ? <WalletMultiButton /> : <div style={{ width: 170, height: 40 }} />}</div>
         </div>
 
         {!inGame && (
@@ -402,7 +439,9 @@ export default function Page() {
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 700 }}>Create game</div>
                     <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>
-                      Deposit goes to the pot. <span style={{ color: "rgba(255,255,255,.85)" }}>3%</span> fee is taken instantly.
+                      Deposit goes to the pot.{" "}
+                      <span style={{ color: "rgba(255,255,255,.85)" }}>3%</span>{" "}
+                      fee is taken instantly.
                     </div>
                   </div>
                   <div className="ttt-dim" style={{ fontSize: 12 }}>min {MIN_BET_SOL} SOL</div>
@@ -704,7 +743,7 @@ export default function Page() {
                         Join
                       </button>
 
-                      {me && g.createdBy === me && (
+                      {publicKey?.toBase58() && g.createdBy === publicKey?.toBase58() && (
                         <button
                           onClick={() => cancelGame(g.id)}
                           className="btn-premium ring-violet-hover"
@@ -729,14 +768,7 @@ export default function Page() {
 
         {/* In-game */}
         {inGame && (
-          <section
-            className="glass glass-rim glass-noise ttt-mt26"
-            // ✅ slightly smaller padding on mobile, keeps board visible
-            style={{
-              borderRadius: 24,
-              padding: 16,
-            }}
-          >
+          <section className="glass glass-rim glass-noise ttt-mt26" style={{ borderRadius: 24, padding: 16 }}>
             <div className="ttt-row" style={{ flexWrap: "wrap" }}>
               <div style={{ display: "grid", gap: 6 }}>
                 <div>
@@ -786,7 +818,7 @@ export default function Page() {
               </button>
             </div>
 
-            {/* ✅ smaller board */}
+            {/* smaller board */}
             <div
               style={{
                 marginTop: 12,
@@ -817,7 +849,7 @@ export default function Page() {
 
             {game?.status === "FINISHED" && (
               <div className="ttt-mt18 ttt-item">
-                <b>{game?.winnerPubkey === me ? "You Win 🏆" : "You Lose 😭"}</b>
+                <b>{game?.winnerPubkey === publicKey?.toBase58() ? "You Win 🏆" : "You Lose 😭"}</b>
                 <div className="ttt-dim" style={{ fontSize: 12 }}>Click “Back to lobby”.</div>
               </div>
             )}

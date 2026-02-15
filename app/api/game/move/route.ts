@@ -48,9 +48,16 @@ function applyTurnMove(g: any, index: number) {
 
   const w = winnerOf(g.board);
   if (w) {
+    // ✅ IMPORTANT FIX:
+    // Set winnerPubkey immediately so frontend can show correct Win/Lose
+    const winnerPk = w === "X" ? g.xPlayer : g.oPlayer;
+
     g.status = "FINISHED";
     g.winner = w;
+    g.winnerPubkey = winnerPk;
+    g.endedReason = "WIN";
     g.updatedAt = now();
+
     return { ok: true, finished: true, draw: false };
   }
 
@@ -61,13 +68,13 @@ function applyTurnMove(g: any, index: number) {
     g.draws = Number(g.draws ?? 0) + 1;
     g.status = "PLAYING";
     g.turn = other(mark);
-    g.deadlineAt = now() + MOVE_MS;
+    g.deadlineAt = now() + MOVE_MS; // ✅ timer reset
     g.updatedAt = now();
     return { ok: true, finished: false, draw: true };
   }
 
   g.turn = other(mark);
-  g.deadlineAt = now() + MOVE_MS;
+  g.deadlineAt = now() + MOVE_MS; // ✅ timer reset each move
   g.updatedAt = now();
   return { ok: true, finished: false, draw: false };
 }
@@ -95,7 +102,8 @@ async function maybePayout(gameId: string, g: any) {
   const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
   if (fresh.payoutSig && fresh.winnerPubkey) return { paid: true, sig: fresh.payoutSig as string };
 
-  const winnerPk = fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer;
+  // ✅ winnerPubkey might already be set (we set it immediately in applyTurnMove)
+  const winnerPk = fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
   fresh.winnerPubkey = winnerPk;
   fresh.endedReason = "WIN";
 
