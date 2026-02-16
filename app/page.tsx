@@ -67,13 +67,15 @@ export default function Page() {
   const [history, setHistory] = useState<any[]>([]);
   const [gameId, setGameId] = useState<string | null>(null);
   const [game, setGame] = useState<Game | null>(null);
-  const [secondsLeft, setSecondsLeft] = useState(0);
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ serverNow ~= Date.now() + serverOffsetMs
-  const [serverOffsetMs, setServerOffsetMs] = useState(0);
-  const lastServerNowRef = useRef<number>(0);
+  // ✅ Robust timer: localDeadlineAt is computed from (deadlineAt - serverNow)
+  const [localDeadlineAt, setLocalDeadlineAt] = useState<number | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+
+  // keep last computed remaining so we don't jitter on small polling differences
+  const lastLocalDeadlineRef = useRef<number | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -109,19 +111,6 @@ export default function Page() {
     setCustom(String(v));
   };
 
-  const serverNow = () => Date.now() + serverOffsetMs;
-
-  function updateServerOffsetFrom(serverNowMs?: any) {
-    const sn = Number(serverNowMs);
-    if (!Number.isFinite(sn) || sn <= 0) return;
-
-    // avoid jitter
-    if (sn !== lastServerNowRef.current) {
-      lastServerNowRef.current = sn;
-      setServerOffsetMs(sn - Date.now());
-    }
-  }
-
   const refreshLobby = async () => {
     const j = await fetchJson("/api/game/list");
     setLobby(j.games ?? []);
@@ -156,37 +145,6 @@ export default function Page() {
     };
   }, []);
 
-  // poll current game (also sync server clock from API)
-  useEffect(() => {
-    if (!gameId) return;
-    const t = setInterval(async () => {
-      try {
-        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
-        updateServerOffsetFrom(j.serverNow);
-        setGame(j.game);
-      } catch {}
-    }, 900);
-    return () => clearInterval(t);
-  }, [gameId]);
-
-  // ✅ countdown uses serverNow()
-  useEffect(() => {
-    if (!game || game.status !== "PLAYING" || !game.deadlineAt) {
-      setSecondsLeft(0);
-      return;
-    }
-
-    const tick = () => {
-      const remainingMs = Number(game.deadlineAt) - serverNow();
-      const remaining = Math.max(0, Math.ceil(remainingMs / 1000));
-      setSecondsLeft(remaining);
-    };
-
-    tick();
-    const interval = setInterval(tick, 200);
-    return () => clearInterval(interval);
-  }, [game?.deadlineAt, game?.status, game?.updatedAt, serverOffsetMs]);
-
   // restore session token
   useEffect(() => {
     if (!publicKey || !gameId) return;
@@ -194,6 +152,60 @@ export default function Page() {
     const t = localStorage.getItem(key);
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
+
+  // poll current game
+  useEffect(() => {
+    if (!gameId) return;
+
+    const t = setInterval(async () => {
+      try {
+        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
+
+        const g = j.game;
+        const serverNow = Number(j.serverNow);
+
+        setGame(g);
+
+        // ✅ Build a local deadline that matches server deadline without clock sync
+        if (g?.status === "PLAYING" && g?.deadlineAt && Number.isFinite(serverNow)) {
+          const deadlineAt = Number(g.deadlineAt);
+          if (Number.isFinite(deadlineAt)) {
+            const remainingMs = deadlineAt - serverNow; // server-time delta
+            const nextLocalDeadline = Date.now() + Math.max(0, remainingMs);
+
+            // avoid jitter if polling causes +/- small ms differences
+            const prev = lastLocalDeadlineRef.current;
+            if (prev == null || Math.abs(prev - nextLocalDeadline) > 300) {
+              lastLocalDeadlineRef.current = nextLocalDeadline;
+              setLocalDeadlineAt(nextLocalDeadline);
+            }
+          }
+        } else {
+          lastLocalDeadlineRef.current = null;
+          setLocalDeadlineAt(null);
+        }
+      } catch {}
+    }, 900);
+
+    return () => clearInterval(t);
+  }, [gameId]);
+
+  // countdown ticks locally against localDeadlineAt
+  useEffect(() => {
+    if (!game || game.status !== "PLAYING" || !localDeadlineAt) {
+      setSecondsLeft(0);
+      return;
+    }
+
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((localDeadlineAt - Date.now()) / 1000));
+      setSecondsLeft(remaining);
+    };
+
+    tick();
+    const interval = setInterval(tick, 200);
+    return () => clearInterval(interval);
+  }, [game?.status, game?.updatedAt, localDeadlineAt]);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -264,6 +276,8 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
+      setLocalDeadlineAt(null);
+      lastLocalDeadlineRef.current = null;
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -288,14 +302,20 @@ export default function Page() {
         }),
       });
 
-      // If join route also returns serverNow in future, we’ll use it (safe)
-      updateServerOffsetFrom(j.serverNow);
-
       setGameId(id);
       setGame(j.game);
 
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
+
+      // best-effort: start local deadline immediately if join response has deadlineAt
+      if (j.game?.status === "PLAYING" && j.game?.deadlineAt) {
+        // We don't have serverNow here reliably, so we let /get fix it within 0.9s.
+        // But we can at least avoid flashing "0" by assuming remaining=20s:
+        const assumed = Date.now() + 20_000;
+        lastLocalDeadlineRef.current = assumed;
+        setLocalDeadlineAt(assumed);
+      }
 
       toast.success("Joined game");
     } catch (e: any) {
@@ -317,8 +337,17 @@ export default function Page() {
         body: JSON.stringify({ gameId, index: i, sessionToken: tok }),
       });
 
-      updateServerOffsetFrom(j.serverNow);
       setGame(j.game);
+
+      // after move, /get will recompute exact localDeadlineAt within 0.9s
+      if (j.game?.status === "PLAYING") {
+        const assumed = Date.now() + 20_000;
+        lastLocalDeadlineRef.current = assumed;
+        setLocalDeadlineAt(assumed);
+      } else {
+        lastLocalDeadlineRef.current = null;
+        setLocalDeadlineAt(null);
+      }
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
@@ -681,6 +710,8 @@ export default function Page() {
                   setGameId(null);
                   setGame(null);
                   setSessionToken(null);
+                  setLocalDeadlineAt(null);
+                  lastLocalDeadlineRef.current = null;
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
