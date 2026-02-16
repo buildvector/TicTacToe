@@ -15,8 +15,7 @@ const BET_PRESETS_SOL = [0.1, 0.25, 0.5, 1] as const;
 const MIN_BET_SOL = 0.1;
 const MAX_BET_SOL = 5;
 
-const MOVE_SECONDS = 20; // ✅ UI timer (server bruger også 20s)
-
+const MOVE_SECONDS = 20; // server = 20s
 const WalletMultiButton = dynamic(
   async () => (await import("@solana/wallet-adapter-react-ui")).WalletMultiButton,
   { ssr: false }
@@ -27,7 +26,12 @@ function net(lamports: number) {
 }
 
 async function fetchJson(url: string, init?: RequestInit) {
-  const res = await fetch(url, { ...init, cache: "no-store" });
+  const res = await fetch(url, {
+    ...init,
+    cache: "no-store",
+    headers: { ...(init?.headers || {}), "cache-control": "no-store" },
+  });
+
   const text = await res.text();
   let data: any = null;
 
@@ -72,10 +76,11 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ UI countdown
+  // ✅ Server-authoritative timer display
   const [secondsLeft, setSecondsLeft] = useState<number>(0);
-  const lastTickAtRef = useRef<number>(0);
-  const lastUpdatedAtRef = useRef<number | null>(null);
+
+  // Used only for fallback if serverSecondsLeft is missing
+  const lastSeenDeadlineRef = useRef<number | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -112,12 +117,12 @@ export default function Page() {
   };
 
   const refreshLobby = async () => {
-    const j = await fetchJson("/api/game/list");
+    const j = await fetchJson("/api/game/list?t=" + Date.now());
     setLobby(j.games ?? []);
   };
 
   const refreshHistory = async () => {
-    const hj = await fetchJson("/api/game/history");
+    const hj = await fetchJson("/api/game/history?t=" + Date.now());
     setHistory(hj.history ?? []);
   };
 
@@ -145,16 +150,37 @@ export default function Page() {
     };
   }, []);
 
-  // poll current game
+  // poll current game (pull serverSecondsLeft)
   useEffect(() => {
     if (!gameId) return;
 
     const t = setInterval(async () => {
       try {
-        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
+        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}&t=${Date.now()}`);
+
         setGame(j.game);
-      } catch {}
-    }, 900);
+
+        // ✅ BEST: serverSecondsLeft
+        if (typeof j.serverSecondsLeft === "number") {
+          const v = Math.max(0, Math.min(MOVE_SECONDS, Math.floor(j.serverSecondsLeft)));
+          setSecondsLeft(v);
+        } else {
+          // fallback: compute from deadlineAt (client clock) but clamp hard
+          const d = Number(j?.game?.deadlineAt);
+          if (Number.isFinite(d) && d > 0) {
+            lastSeenDeadlineRef.current = d;
+            const s = Math.ceil((d - Date.now()) / 1000);
+            const v = Math.max(0, Math.min(MOVE_SECONDS, s));
+            setSecondsLeft(v);
+          } else {
+            setSecondsLeft(0);
+          }
+        }
+      } catch {
+        // if fetch fails, don't keep showing stale 3s
+        setSecondsLeft((prev) => Math.max(0, Math.min(MOVE_SECONDS, prev)));
+      }
+    }, 700);
 
     return () => clearInterval(t);
   }, [gameId]);
@@ -166,36 +192,6 @@ export default function Page() {
     const t = localStorage.getItem(key);
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
-
-  // ✅ RESET UI TIMER når tur starter (updatedAt ændrer sig)
-  useEffect(() => {
-    if (!game) return;
-
-    if (game.status === "PLAYING") {
-      const u = Number(game.updatedAt ?? 0);
-      const prev = lastUpdatedAtRef.current;
-
-      // når der kommer et nyt "tick" fra server (move/auto-move/join), resetter vi timeren til 20
-      if (Number.isFinite(u) && u > 0 && (prev === null || u !== prev)) {
-        lastUpdatedAtRef.current = u;
-        setSecondsLeft(MOVE_SECONDS);
-        lastTickAtRef.current = Date.now();
-      }
-    } else {
-      setSecondsLeft(0);
-    }
-  }, [game?.status, game?.updatedAt]);
-
-  // ✅ UI countdown tick (ren visuel)
-  useEffect(() => {
-    const t = setInterval(() => {
-      setSecondsLeft((s) => {
-        if (s <= 0) return 0;
-        return Math.max(0, s - 1);
-      });
-    }, 1000);
-    return () => clearInterval(t);
-  }, []);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -240,6 +236,9 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
+      setSecondsLeft(0);
+      lastSeenDeadlineRef.current = null;
+
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -267,7 +266,7 @@ export default function Page() {
       setGame(null);
       setSessionToken(null);
       setSecondsLeft(0);
-      lastUpdatedAtRef.current = null;
+      lastSeenDeadlineRef.current = null;
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -298,8 +297,8 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      // UI timer starter når updatedAt ændrer sig, men vi nulstiller ref så den trigger sikkert
-      lastUpdatedAtRef.current = null;
+      setSecondsLeft(0);
+      lastSeenDeadlineRef.current = null;
 
       toast.success("Joined game");
     } catch (e: any) {
@@ -323,6 +322,7 @@ export default function Page() {
 
       setGame(j.game);
 
+      // timer kommer fra /get poll, så intet lokalt reset her
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
         toast.success(win ? "You Win 🏆" : "You Lose 😭");
@@ -687,7 +687,7 @@ export default function Page() {
                   setGame(null);
                   setSessionToken(null);
                   setSecondsLeft(0);
-                  lastUpdatedAtRef.current = null;
+                  lastSeenDeadlineRef.current = null;
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
