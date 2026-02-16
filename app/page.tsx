@@ -122,6 +122,13 @@ export default function Page() {
     }
   }
 
+  // ✅ Key fix: after create/join, immediately fetch /api/game/get once to sync serverNow
+  async function syncFromGame(id: string) {
+    const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(id)}`);
+    updateServerOffsetFrom(j.serverNow);
+    setGame(j.game);
+  }
+
   const refreshLobby = async () => {
     const j = await fetchJson("/api/game/list");
     setLobby(j.games ?? []);
@@ -164,9 +171,6 @@ export default function Page() {
         const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
         updateServerOffsetFrom(j.serverNow);
         setGame(j.game);
-
-        // if payout happened server-side, update UI quietly
-        // (optional: you can toast here if you want)
       } catch {}
     }, 900);
     return () => clearInterval(t);
@@ -240,6 +244,9 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
+      // ✅ immediate serverNow sync so timer starts at ~20s (not ~3s)
+      await syncFromGame(j.gameId);
+
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -295,6 +302,9 @@ export default function Page() {
 
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
+
+      // ✅ immediate serverNow sync so timer starts at ~20s (not ~3s)
+      await syncFromGame(id);
 
       toast.success("Joined game");
     } catch (e: any) {
