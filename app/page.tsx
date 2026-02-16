@@ -71,7 +71,7 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // serverNow ~= Date.now() + serverOffsetMs
+  // ✅ serverNow ~= Date.now() + serverOffsetMs
   const [serverOffsetMs, setServerOffsetMs] = useState(0);
   const lastServerNowRef = useRef<number>(0);
 
@@ -115,18 +115,11 @@ export default function Page() {
     const sn = Number(serverNowMs);
     if (!Number.isFinite(sn) || sn <= 0) return;
 
-    // only update if it actually changes to avoid jitter
+    // avoid jitter
     if (sn !== lastServerNowRef.current) {
       lastServerNowRef.current = sn;
       setServerOffsetMs(sn - Date.now());
     }
-  }
-
-  // ✅ Key fix: after create/join, immediately fetch /api/game/get once to sync serverNow
-  async function syncFromGame(id: string) {
-    const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(id)}`);
-    updateServerOffsetFrom(j.serverNow);
-    setGame(j.game);
   }
 
   const refreshLobby = async () => {
@@ -176,7 +169,7 @@ export default function Page() {
     return () => clearInterval(t);
   }, [gameId]);
 
-  // countdown uses serverNow()
+  // ✅ countdown uses serverNow()
   useEffect(() => {
     if (!game || game.status !== "PLAYING" || !game.deadlineAt) {
       setSecondsLeft(0);
@@ -184,12 +177,13 @@ export default function Page() {
     }
 
     const tick = () => {
-      const remaining = Math.max(0, Math.ceil((Number(game.deadlineAt) - serverNow()) / 1000));
+      const remainingMs = Number(game.deadlineAt) - serverNow();
+      const remaining = Math.max(0, Math.ceil(remainingMs / 1000));
       setSecondsLeft(remaining);
     };
 
     tick();
-    const interval = setInterval(tick, 250);
+    const interval = setInterval(tick, 200);
     return () => clearInterval(interval);
   }, [game?.deadlineAt, game?.status, game?.updatedAt, serverOffsetMs]);
 
@@ -244,9 +238,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
-      // ✅ immediate serverNow sync so timer starts at ~20s (not ~3s)
-      await syncFromGame(j.gameId);
-
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -297,14 +288,14 @@ export default function Page() {
         }),
       });
 
+      // If join route also returns serverNow in future, we’ll use it (safe)
+      updateServerOffsetFrom(j.serverNow);
+
       setGameId(id);
       setGame(j.game);
 
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
-
-      // ✅ immediate serverNow sync so timer starts at ~20s (not ~3s)
-      await syncFromGame(id);
 
       toast.success("Joined game");
     } catch (e: any) {
@@ -326,6 +317,7 @@ export default function Page() {
         body: JSON.stringify({ gameId, index: i, sessionToken: tok }),
       });
 
+      updateServerOffsetFrom(j.serverNow);
       setGame(j.game);
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {

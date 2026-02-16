@@ -89,27 +89,39 @@ async function acquireLock(key: string, seconds = 10) {
 }
 
 async function maybePayout(gameId: string, g: any) {
-  if (g.status !== "FINISHED" || !g.winner) return { paid: false, sig: null as string | null };
-  if (g.payoutSig && g.winnerPubkey) return { paid: true, sig: g.payoutSig as string };
+  if (g.status !== "FINISHED" || !g.winner) {
+    return { paid: false, sig: null as string | null };
+  }
+
+  if (g.payoutSig && g.winnerPubkey) {
+    return { paid: true, sig: g.payoutSig as string };
+  }
 
   const locked = await acquireLock(`payoutlock:${gameId}`, 15);
   if (!locked) return { paid: false, sig: null };
 
   const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
-  if (fresh.payoutSig && fresh.winnerPubkey) return { paid: true, sig: fresh.payoutSig as string };
+  if (fresh.payoutSig && fresh.winnerPubkey) {
+    return { paid: true, sig: fresh.payoutSig as string };
+  }
 
-  const winnerPk = fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
+  const winnerPk =
+    fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
+
   fresh.winnerPubkey = winnerPk;
   fresh.endedReason = "WIN";
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
-  const sig = await payoutFromTreasury(new PublicKey(winnerPk), Number(fresh.potLamports));
+  const sig = await payoutFromTreasury(
+    new PublicKey(winnerPk),
+    Number(fresh.potLamports)
+  );
+
   fresh.payoutSig = sig;
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
-  // history best-effort
   try {
     const item = {
       at: now(),
@@ -129,16 +141,19 @@ async function maybePayout(gameId: string, g: any) {
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const gameId = searchParams.get("gameId");
-  if (!gameId) return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
+  if (!gameId) {
+    return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
+  }
 
-  const g = await kv.get<any>(`game:${gameId}`);
-  if (!g) return NextResponse.json({ error: "Not found" }, { status: 404 });
-
-  let payoutSig: string | null = g.payoutSig ?? null;
+  let g = await kv.get<any>(`game:${gameId}`);
+  if (!g) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
 
   // auto-move on server if deadline passed
   if (g.status === "PLAYING" && g.deadlineAt && now() > Number(g.deadlineAt)) {
     const idx = autoMoveIndex(g);
+
     if (idx >= 0) {
       applyTurnMove(g, idx);
     } else {
@@ -151,17 +166,19 @@ export async function GET(req: Request) {
 
     await kv.set(`game:${gameId}`, g);
 
-    // payout if finished by auto-move
+    // if finished by auto-move => payout
     if (g.status === "FINISHED" && g.winner) {
-      const p = await maybePayout(gameId, g);
-      payoutSig = p.sig;
+      await maybePayout(gameId, g);
     }
+
+    // ✅ IMPORTANT: re-fetch to return the final authoritative state
+    g = (await kv.get<any>(`game:${gameId}`)) ?? g;
   }
 
   return NextResponse.json({
     ok: true,
     game: g,
-    payoutSig,
+    payoutSig: g.payoutSig ?? null,
     serverNow: now(),
   });
 }
