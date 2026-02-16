@@ -42,19 +42,16 @@ function applyTurnMove(g: any, index: number) {
 
   const mark: "X" | "O" = g.turn === "O" ? "O" : "X";
   g.board[index] = mark;
-
   g.moves = Number(g.moves ?? 0) + 1;
 
   const w = winnerOf(g.board);
   if (w) {
     const winnerPk = w === "X" ? g.xPlayer : g.oPlayer;
-
     g.status = "FINISHED";
     g.winner = w;
     g.winnerPubkey = winnerPk;
     g.endedReason = "WIN";
     g.updatedAt = now();
-
     return { ok: true, finished: true, draw: false };
   }
 
@@ -108,7 +105,6 @@ async function maybePayout(gameId: string, g: any) {
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
-  // history best-effort
   try {
     const item = {
       at: now(),
@@ -135,12 +131,28 @@ export async function GET(req: Request) {
 
   let payoutSig: string | null = g.payoutSig ?? null;
 
-  // ✅ Self-heal: if game is PLAYING but deadlineAt is missing/bad -> reset to 20s
+  const serverNow = now();
+
+  // ✅ Strong self-heal of timer
   if (g.status === "PLAYING") {
     const d = Number(g.deadlineAt);
-    if (!Number.isFinite(d) || d <= 0) {
-      g.deadlineAt = now() + MOVE_MS;
-      g.updatedAt = now();
+    const moves = Number(g.moves ?? 0);
+
+    const remainingMs = Number.isFinite(d) ? d - serverNow : NaN;
+
+    // Fix cases:
+    // - missing/invalid
+    // - expired or far in future
+    // - suspiciously short RIGHT after game start (moves === 0) => your “3 seconds” bug
+    const needsFix =
+      !Number.isFinite(d) ||
+      remainingMs <= 0 ||
+      remainingMs > MOVE_MS + 2_000 ||
+      (moves === 0 && remainingMs < MOVE_MS - 2_000);
+
+    if (needsFix) {
+      g.deadlineAt = serverNow + MOVE_MS;
+      g.updatedAt = serverNow;
       await kv.set(`game:${gameId}`, g);
     }
   }
@@ -166,8 +178,6 @@ export async function GET(req: Request) {
     }
   }
 
-  // ✅ SERVER-TRUE timer (same clock as join/move)
-  const serverNow = now();
   const deadlineAt =
     g?.status === "PLAYING" && g?.deadlineAt ? Number(g.deadlineAt) : null;
 
