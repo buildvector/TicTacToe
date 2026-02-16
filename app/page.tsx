@@ -3,12 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import {
-  PublicKey,
-  Transaction,
-  SystemProgram,
-  LAMPORTS_PER_SOL,
-} from "@solana/web3.js";
+import { PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import toast, { Toaster } from "react-hot-toast";
 
 type Game = any;
@@ -76,16 +71,13 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ serverNow ~= Date.now() + serverOffsetMs
+  // serverNow ~= Date.now() + serverOffsetMs
   const [serverOffsetMs, setServerOffsetMs] = useState(0);
-  const syncingRef = useRef(false);
+  const lastServerNowRef = useRef<number>(0);
 
   useEffect(() => setMounted(true), []);
 
-  const betLamports = useMemo(
-    () => Math.floor(betSol * LAMPORTS_PER_SOL),
-    [betSol]
-  );
+  const betLamports = useMemo(() => Math.floor(betSol * LAMPORTS_PER_SOL), [betSol]);
   const feeLamports = useMemo(
     () => Math.max(1, Math.floor((betLamports * FEE_BPS) / 10_000)),
     [betLamports]
@@ -119,23 +111,14 @@ export default function Page() {
 
   const serverNow = () => Date.now() + serverOffsetMs;
 
-  // ✅ Real server time sync (HTTP Date header). Fixes 2s -> 18s jump.
-  async function syncServerClock() {
-    if (syncingRef.current) return;
-    syncingRef.current = true;
-    try {
-      const res = await fetch("/", { method: "HEAD", cache: "no-store" });
-      const date = res.headers.get("date");
-      if (date) {
-        const serverMs = Date.parse(date);
-        if (Number.isFinite(serverMs)) {
-          setServerOffsetMs(serverMs - Date.now());
-        }
-      }
-    } catch {
-      // ignore
-    } finally {
-      syncingRef.current = false;
+  function updateServerOffsetFrom(serverNowMs?: any) {
+    const sn = Number(serverNowMs);
+    if (!Number.isFinite(sn) || sn <= 0) return;
+
+    // only update if it actually changes to avoid jitter
+    if (sn !== lastServerNowRef.current) {
+      lastServerNowRef.current = sn;
+      setServerOffsetMs(sn - Date.now());
     }
   }
 
@@ -154,7 +137,6 @@ export default function Page() {
 
     (async () => {
       try {
-        await syncServerClock();
         await refreshLobby();
         await refreshHistory();
       } catch {}
@@ -163,12 +145,10 @@ export default function Page() {
     const t = setInterval(async () => {
       if (!alive) return;
       try {
-        // re-sync occasionally so countdown stays stable
-        await syncServerClock();
         await refreshLobby();
         await refreshHistory();
       } catch {}
-    }, 10_000);
+    }, 1500);
 
     return () => {
       alive = false;
@@ -176,19 +156,23 @@ export default function Page() {
     };
   }, []);
 
-  // poll current game
+  // poll current game (also sync server clock from API)
   useEffect(() => {
     if (!gameId) return;
     const t = setInterval(async () => {
       try {
         const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
+        updateServerOffsetFrom(j.serverNow);
         setGame(j.game);
+
+        // if payout happened server-side, update UI quietly
+        // (optional: you can toast here if you want)
       } catch {}
     }, 900);
     return () => clearInterval(t);
   }, [gameId]);
 
-  // ✅ countdown uses serverNow()
+  // countdown uses serverNow()
   useEffect(() => {
     if (!game || game.status !== "PLAYING" || !game.deadlineAt) {
       setSecondsLeft(0);
@@ -196,10 +180,7 @@ export default function Page() {
     }
 
     const tick = () => {
-      const remaining = Math.max(
-        0,
-        Math.ceil((Number(game.deadlineAt) - serverNow()) / 1000)
-      );
+      const remaining = Math.max(0, Math.ceil((Number(game.deadlineAt) - serverNow()) / 1000));
       setSecondsLeft(remaining);
     };
 
@@ -257,13 +238,7 @@ export default function Page() {
 
       setGameId(j.gameId);
       setSessionToken(j.sessionToken);
-      localStorage.setItem(
-        sessionKey(publicKey.toBase58(), j.gameId),
-        j.sessionToken
-      );
-
-      // ✅ get fresh server time right after creating
-      await syncServerClock();
+      localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
       toast.success("Game created");
     } catch (e: any) {
@@ -276,8 +251,7 @@ export default function Page() {
     try {
       if (!publicKey) return toast.error("Connect wallet first");
 
-      const tok =
-        sessionToken || localStorage.getItem(sessionKey(publicKey.toBase58(), id));
+      const tok = sessionToken || localStorage.getItem(sessionKey(publicKey.toBase58(), id));
       if (!tok) return toast.error("Missing session (refresh → re-create/join)");
 
       toast.loading("Refunding 97%...");
@@ -292,8 +266,6 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
-
-      await syncServerClock();
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -324,9 +296,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      // ✅ sync right after join (prevents weird countdown start)
-      await syncServerClock();
-
       toast.success("Joined game");
     } catch (e: any) {
       toast.dismiss();
@@ -338,9 +307,7 @@ export default function Page() {
     try {
       if (!publicKey || !gameId) return;
 
-      const tok =
-        sessionToken ||
-        localStorage.getItem(sessionKey(publicKey.toBase58(), gameId));
+      const tok = sessionToken || localStorage.getItem(sessionKey(publicKey.toBase58(), gameId));
       if (!tok) return toast.error("Missing session (refresh → re-join)");
 
       const j = await fetchJson("/api/game/move", {
@@ -350,9 +317,6 @@ export default function Page() {
       });
 
       setGame(j.game);
-
-      // ✅ keep clock synced after moves (mobile can drift)
-      await syncServerClock();
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
@@ -387,42 +351,16 @@ export default function Page() {
 
       <div className="casino-wrap ttt-container">
         {/* Header */}
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            gap: 16,
-            flexWrap: "wrap",
-            alignItems: "flex-start",
-          }}
-        >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
           <div style={{ display: "grid", gap: 6, maxWidth: 640 }}>
-            <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -0.2 }}>
-              Tic Tac Toe
-            </div>
+            <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -0.2 }}>Tic Tac Toe</div>
             <div className="ttt-dim" style={{ fontSize: 13 }}>
-              Premium P2P tic-tac-toe. Both players deposit to the same pot.
-              Winner paid out server-side.
+              Premium P2P tic-tac-toe. Both players deposit to the same pot. Winner paid out server-side.
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <span
-                className="ttt-item"
-                style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}
-              >
-                3% fee / deposit
-              </span>
-              <span
-                className="ttt-item"
-                style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}
-              >
-                Refund 97%
-              </span>
-              <span
-                className="ttt-item"
-                style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}
-              >
-                No house edge
-              </span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>3% fee / deposit</span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>Refund 97%</span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>No house edge</span>
             </div>
           </div>
 
@@ -439,9 +377,7 @@ export default function Page() {
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 700 }}>Create game</div>
                     <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>
-                      Deposit goes to the pot.{" "}
-                      <span style={{ color: "rgba(255,255,255,.85)" }}>3%</span>{" "}
-                      fee is taken instantly.
+                      Deposit goes to the pot. <span style={{ color: "rgba(255,255,255,.85)" }}>3%</span> fee is taken instantly.
                     </div>
                   </div>
                   <div className="ttt-dim" style={{ fontSize: 12 }}>min {MIN_BET_SOL} SOL</div>
@@ -449,9 +385,7 @@ export default function Page() {
 
                 {/* Bet buttons */}
                 <div className="ttt-mt18" style={{ display: "grid", gap: 10 }}>
-                  <div style={{ fontSize: 11, letterSpacing: 1.2, opacity: 0.7 }}>
-                    BET SIZE
-                  </div>
+                  <div style={{ fontSize: 11, letterSpacing: 1.2, opacity: 0.7 }}>BET SIZE</div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
                     {BET_PRESETS_SOL.map((x) => {
@@ -476,9 +410,7 @@ export default function Page() {
                           }}
                         >
                           <div style={{ fontSize: 13, fontWeight: 800 }}>{x} SOL</div>
-                          <div style={{ fontSize: 12, opacity: active ? 0.75 : 0.6 }}>
-                            {active ? "Selected" : "Click to select"}
-                          </div>
+                          <div style={{ fontSize: 12, opacity: active ? 0.75 : 0.6 }}>{active ? "Selected" : "Click to select"}</div>
                         </button>
                       );
                     })}
@@ -486,9 +418,7 @@ export default function Page() {
 
                   {/* Custom bet */}
                   <div className="ttt-mt12" style={{ display: "grid", gap: 8 }}>
-                    <div style={{ fontSize: 11, letterSpacing: 1.2, opacity: 0.7 }}>
-                      CUSTOM BET (SOL)
-                    </div>
+                    <div style={{ fontSize: 11, letterSpacing: 1.2, opacity: 0.7 }}>CUSTOM BET (SOL)</div>
 
                     <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                       <input
@@ -496,13 +426,7 @@ export default function Page() {
                         onChange={(e) => setCustom(e.target.value)}
                         placeholder={`e.g. ${MIN_BET_SOL}`}
                         className="input-premium"
-                        style={{
-                          flex: 1,
-                          borderRadius: 14,
-                          padding: "12px 14px",
-                          outline: "none",
-                          color: "rgba(255,255,255,.92)",
-                        }}
+                        style={{ flex: 1, borderRadius: 14, padding: "12px 14px", outline: "none", color: "rgba(255,255,255,.92)" }}
                       />
 
                       <button
@@ -522,11 +446,7 @@ export default function Page() {
                       </button>
                     </div>
 
-                    {customError ? (
-                      <div style={{ fontSize: 12, color: "rgba(252,165,165,0.95)" }}>
-                        {customError}
-                      </div>
-                    ) : null}
+                    {customError ? <div style={{ fontSize: 12, color: "rgba(252,165,165,0.95)" }}>{customError}</div> : null}
 
                     <div className="ttt-dim" style={{ fontSize: 12 }}>
                       MVP limits: {MIN_BET_SOL} – {MAX_BET_SOL} SOL.
@@ -538,30 +458,22 @@ export default function Page() {
                 <div className="ttt-mt18 ttt-item ttt-itemPad" style={{ alignItems: "stretch", gap: 14, flexDirection: "column" }}>
                   <div className="ttt-row">
                     <div className="ttt-dim" style={{ fontSize: 12 }}>Fee (3%)</div>
-                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>
-                      {(feeLamports / 1e9).toFixed(6)} SOL
-                    </div>
+                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>{(feeLamports / 1e9).toFixed(6)} SOL</div>
                   </div>
 
                   <div className="ttt-row">
                     <div className="ttt-dim" style={{ fontSize: 12 }}>Pot (after fee)</div>
-                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>
-                      {(potLamports / 1e9).toFixed(6)} SOL
-                    </div>
+                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>{(potLamports / 1e9).toFixed(6)} SOL</div>
                   </div>
 
                   <div style={{ height: 1, background: "rgba(255,255,255,0.10)" }} />
 
                   <div className="ttt-row">
                     <div className="ttt-dim" style={{ fontSize: 12 }}>Potential payout</div>
-                    <div className="mono" style={{ fontWeight: 900, fontSize: 12 }}>
-                      {((potLamports * 2) / 1e9).toFixed(6)} SOL
-                    </div>
+                    <div className="mono" style={{ fontWeight: 900, fontSize: 12 }}>{((potLamports * 2) / 1e9).toFixed(6)} SOL</div>
                   </div>
 
-                  <div className="ttt-dim" style={{ fontSize: 12 }}>
-                    Winner receives both pots (2×). No house edge.
-                  </div>
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>Winner receives both pots (2×). No house edge.</div>
                 </div>
 
                 {/* CTA */}
@@ -584,9 +496,7 @@ export default function Page() {
                     Create & deposit
                   </button>
 
-                  <div className="ttt-dim" style={{ fontSize: 12 }}>
-                    You will sign a transfer in Phantom.
-                  </div>
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>You will sign a transfer in Phantom.</div>
                 </div>
               </section>
 
@@ -608,22 +518,14 @@ export default function Page() {
                       }
                     }}
                     className="btn-premium ring-violet-hover"
-                    style={{
-                      borderRadius: 14,
-                      padding: "10px 14px",
-                      fontWeight: 900,
-                      color: "rgba(255,255,255,0.92)",
-                      cursor: "pointer",
-                    }}
+                    style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
                   >
                     Refresh
                   </button>
                 </div>
 
                 <div className="ttt-mt12" style={{ display: "grid", gap: 10 }}>
-                  {history.length === 0 && (
-                    <div className="ttt-dim" style={{ fontSize: 13 }}>No games yet…</div>
-                  )}
+                  {history.length === 0 && <div className="ttt-dim" style={{ fontSize: 13 }}>No games yet…</div>}
 
                   {history.map((h, i) => (
                     <div key={i} className="ttt-item">
@@ -631,14 +533,10 @@ export default function Page() {
                         <div style={{ fontWeight: 800 }}>{h.gameId}</div>
                         <div className="ttt-dim" style={{ fontSize: 12, marginTop: 2 }}>
                           winner{" "}
-                          <span className="mono" style={{ color: "rgba(255,255,255,.9)" }}>
-                            {short(String(h.winner))}
-                          </span>{" "}
-                          · bet {(Number(h.betLamports) / 1e9).toFixed(4)} SOL
+                          <span className="mono" style={{ color: "rgba(255,255,255,.9)" }}>{short(String(h.winner))}</span> · bet{" "}
+                          {(Number(h.betLamports) / 1e9).toFixed(4)} SOL
                         </div>
-                        <div className="ttt-dim" style={{ fontSize: 12 }}>
-                          sig {String(h.payoutSig).slice(0, 10)}…
-                        </div>
+                        <div className="ttt-dim" style={{ fontSize: 12 }}>sig {String(h.payoutSig).slice(0, 10)}…</div>
                       </div>
 
                       <div style={{ flexShrink: 0 }}>
@@ -676,9 +574,7 @@ export default function Page() {
               <div className="ttt-row">
                 <div>
                   <div style={{ fontSize: 14, fontWeight: 800 }}>Open games</div>
-                  <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>
-                    Join an open game. Deposit goes to the pot.
-                  </div>
+                  <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>Join an open game. Deposit goes to the pot.</div>
                 </div>
 
                 <button
@@ -691,26 +587,16 @@ export default function Page() {
                     }
                   }}
                   className="btn-premium ring-violet-hover"
-                  style={{
-                    borderRadius: 14,
-                    padding: "10px 14px",
-                    fontWeight: 900,
-                    color: "rgba(255,255,255,0.92)",
-                    cursor: "pointer",
-                  }}
+                  style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
                 >
                   Refresh
                 </button>
               </div>
 
-              <div className="ttt-mt12 ttt-dim" style={{ fontSize: 12 }}>
-                {lobby.length} open
-              </div>
+              <div className="ttt-mt12 ttt-dim" style={{ fontSize: 12 }}>{lobby.length} open</div>
 
               <div className="ttt-mt12" style={{ display: "grid", gap: 10 }}>
-                {lobby.length === 0 && (
-                  <div className="ttt-dim" style={{ fontSize: 13 }}>No open games.</div>
-                )}
+                {lobby.length === 0 && <div className="ttt-dim" style={{ fontSize: 13 }}>No open games.</div>}
 
                 {lobby.map((g) => (
                   <div key={g.id} className="ttt-item">
@@ -743,17 +629,11 @@ export default function Page() {
                         Join
                       </button>
 
-                      {publicKey?.toBase58() && g.createdBy === publicKey?.toBase58() && (
+                      {me && g.createdBy === me && (
                         <button
                           onClick={() => cancelGame(g.id)}
                           className="btn-premium ring-violet-hover"
-                          style={{
-                            borderRadius: 14,
-                            padding: "10px 12px",
-                            fontWeight: 900,
-                            color: "rgba(255,255,255,0.92)",
-                            cursor: "pointer",
-                          }}
+                          style={{ borderRadius: 14, padding: "10px 12px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
                         >
                           Cancel
                         </button>
@@ -777,18 +657,13 @@ export default function Page() {
                 </div>
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  You are:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{myMark ?? "spectator"}</b>{" "}
-                  · Turn:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{game?.turn ?? "-"}</b>{" "}
-                  · Your turn:{" "}
+                  You are: <b style={{ color: "rgba(255,255,255,.92)" }}>{myMark ?? "spectator"}</b> · Turn:{" "}
+                  <b style={{ color: "rgba(255,255,255,.92)" }}>{game?.turn ?? "-"}</b> · Your turn:{" "}
                   <b style={{ color: "rgba(255,255,255,.92)" }}>{myTurn ? "YES" : "NO"}</b>
                 </div>
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  Time left:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b>{" "}
-                  (auto move at 0)
+                  Time left: <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b> (auto move at 0)
                 </div>
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
@@ -806,19 +681,12 @@ export default function Page() {
                   setSessionToken(null);
                 }}
                 className="btn-premium ring-violet-hover"
-                style={{
-                  borderRadius: 14,
-                  padding: "10px 14px",
-                  fontWeight: 900,
-                  color: "rgba(255,255,255,0.92)",
-                  cursor: "pointer",
-                }}
+                style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
               >
                 Back to lobby
               </button>
             </div>
 
-            {/* smaller board */}
             <div
               style={{
                 marginTop: 12,
@@ -835,12 +703,7 @@ export default function Page() {
                   onClick={() => move(i)}
                   disabled={!myTurn || game?.status !== "PLAYING"}
                   className="ttt-cell"
-                  style={{
-                    width: cellSize,
-                    height: cellSize,
-                    fontSize: "clamp(28px, 7.5vw, 44px)",
-                    borderRadius: 18,
-                  }}
+                  style={{ width: cellSize, height: cellSize, fontSize: "clamp(28px, 7.5vw, 44px)", borderRadius: 18 }}
                 >
                   {c ?? ""}
                 </button>
@@ -849,7 +712,7 @@ export default function Page() {
 
             {game?.status === "FINISHED" && (
               <div className="ttt-mt18 ttt-item">
-                <b>{game?.winnerPubkey === publicKey?.toBase58() ? "You Win 🏆" : "You Lose 😭"}</b>
+                <b>{game?.winnerPubkey === me ? "You Win 🏆" : "You Lose 😭"}</b>
                 <div className="ttt-dim" style={{ fontSize: 12 }}>Click “Back to lobby”.</div>
               </div>
             )}
