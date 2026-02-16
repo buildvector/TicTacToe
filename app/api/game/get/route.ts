@@ -1,15 +1,14 @@
+// app/api/game/get/route.ts
 import { NextResponse } from "next/server";
 import { kv } from "@/lib/kv";
-import { now, autoMoveIndex, emptyBoard } from "@/lib/game";
+import { autoMoveIndex, emptyBoard } from "@/lib/game";
 import { payoutFromTreasury } from "@/lib/sol";
 import { PublicKey } from "@solana/web3.js";
+import { nowMs } from "@/lib/clock";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
 
 const MOVE_MS = 20_000;
-const DEPLOY_MARK = "GET_ROUTE_2026-02-16__DEPLOY_MARK_V1";
 
 const LINES = [
   [0, 1, 2],
@@ -20,7 +19,7 @@ const LINES = [
   [2, 5, 8],
   [0, 4, 8],
   [2, 4, 6],
-] as const;
+];
 
 function other(turn: "X" | "O") {
   return turn === "X" ? "O" : "X";
@@ -38,7 +37,7 @@ function isFull(board: any[]) {
   return board.every((x) => x === "X" || x === "O");
 }
 
-function applyTurnMove(g: any, index: number) {
+function applyTurnMove(g: any, index: number, ts: number) {
   if (!Array.isArray(g.board) || g.board.length !== 9) g.board = emptyBoard();
   if (index < 0 || index > 8) return { ok: false, error: "Bad index" };
   if (g.board[index]) return { ok: false, error: "Cell occupied" };
@@ -54,7 +53,7 @@ function applyTurnMove(g: any, index: number) {
     g.winner = w;
     g.winnerPubkey = winnerPk;
     g.endedReason = "WIN";
-    g.updatedAt = now();
+    g.updatedAt = ts;
     return { ok: true, finished: true, draw: false };
   }
 
@@ -64,14 +63,14 @@ function applyTurnMove(g: any, index: number) {
     g.draws = Number(g.draws ?? 0) + 1;
     g.status = "PLAYING";
     g.turn = other(mark);
-    g.deadlineAt = now() + MOVE_MS;
-    g.updatedAt = now();
+    g.deadlineAt = ts + MOVE_MS;
+    g.updatedAt = ts;
     return { ok: true, finished: false, draw: true };
   }
 
   g.turn = other(mark);
-  g.deadlineAt = now() + MOVE_MS;
-  g.updatedAt = now();
+  g.deadlineAt = ts + MOVE_MS;
+  g.updatedAt = ts;
   return { ok: true, finished: false, draw: false };
 }
 
@@ -100,17 +99,17 @@ async function maybePayout(gameId: string, g: any) {
   const winnerPk = fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
   fresh.winnerPubkey = winnerPk;
   fresh.endedReason = "WIN";
-  fresh.updatedAt = now();
+  fresh.updatedAt = await nowMs();
   await kv.set(`game:${gameId}`, fresh);
 
   const sig = await payoutFromTreasury(new PublicKey(winnerPk), Number(fresh.potLamports));
   fresh.payoutSig = sig;
-  fresh.updatedAt = now();
+  fresh.updatedAt = await nowMs();
   await kv.set(`game:${gameId}`, fresh);
 
   try {
     const item = {
-      at: now(),
+      at: await nowMs(),
       gameId,
       betLamports: fresh.betLamports,
       winner: winnerPk,
@@ -127,27 +126,20 @@ async function maybePayout(gameId: string, g: any) {
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const gameId = searchParams.get("gameId");
-  if (!gameId) return NextResponse.json({ error: "Missing gameId", deployMark: DEPLOY_MARK }, { status: 400 });
+  if (!gameId) return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
 
   const g = await kv.get<any>(`game:${gameId}`);
-  if (!g) return NextResponse.json({ error: "Not found", deployMark: DEPLOY_MARK }, { status: 404 });
+  if (!g) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
   let payoutSig: string | null = g.payoutSig ?? null;
 
-  const serverNow = now();
+  // ✅ Stable clock (Redis TIME) — fixes the Vercel “3 seconds” drift
+  const serverNow = await nowMs();
 
-  // HARD self-heal timer if it’s missing/invalid/expired/suspicious
+  // self-heal timer if missing/invalid
   if (g.status === "PLAYING") {
     const d = Number(g.deadlineAt);
-    const remainingMs = Number.isFinite(d) ? d - serverNow : NaN;
-
-    const needsFix =
-      !Number.isFinite(d) ||
-      remainingMs <= 0 ||
-      remainingMs > MOVE_MS + 2_000 ||
-      remainingMs < 5_000; // if it ever becomes 3s again -> fix to 20s
-
-    if (needsFix) {
+    if (!Number.isFinite(d) || d <= 0) {
       g.deadlineAt = serverNow + MOVE_MS;
       g.updatedAt = serverNow;
       await kv.set(`game:${gameId}`, g);
@@ -155,15 +147,16 @@ export async function GET(req: Request) {
   }
 
   // auto-move if deadline passed
-  if (g.status === "PLAYING" && g.deadlineAt && now() > Number(g.deadlineAt)) {
+  if (g.status === "PLAYING" && g.deadlineAt && serverNow > Number(g.deadlineAt)) {
     const idx = autoMoveIndex(g);
-    if (idx >= 0) applyTurnMove(g, idx);
-    else {
+    if (idx >= 0) {
+      applyTurnMove(g, idx, serverNow);
+    } else {
       g.board = emptyBoard();
       g.moves = 0;
       g.turn = other(g.turn === "O" ? "O" : "X");
-      g.deadlineAt = now() + MOVE_MS;
-      g.updatedAt = now();
+      g.deadlineAt = serverNow + MOVE_MS;
+      g.updatedAt = serverNow;
     }
 
     await kv.set(`game:${gameId}`, g);
@@ -181,15 +174,15 @@ export async function GET(req: Request) {
       ? Math.max(0, Math.ceil((deadlineAt - serverNow) / 1000))
       : 0;
 
-  // ALSO stamp inside game to catch “old wrapper” debugging
-  g._deployMark = DEPLOY_MARK;
+  // Deploy marker so you can verify you hit the new code:
+  const DEPLOY_MARK = "GET_ROUTE_STABLE_TIME_2026-02-16";
 
   return NextResponse.json({
     ok: true,
-    deployMark: DEPLOY_MARK,
+    game: g,
+    payoutSig,
     serverNow,
     serverSecondsLeft,
-    payoutSig,
-    game: g,
+    deployMark: DEPLOY_MARK,
   });
 }
