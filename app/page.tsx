@@ -70,11 +70,6 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ Timer: driven by serverSecondsLeft (authoritative)
-  const [localDeadlineAt, setLocalDeadlineAt] = useState<number | null>(null);
-  const [secondsLeft, setSecondsLeft] = useState(0);
-  const lastLocalDeadlineRef = useRef<number | null>(null);
-
   useEffect(() => setMounted(true), []);
 
   const betLamports = useMemo(() => Math.floor(betSol * LAMPORTS_PER_SOL), [betSol]);
@@ -143,6 +138,20 @@ export default function Page() {
     };
   }, []);
 
+  // poll current game (no timer logic)
+  useEffect(() => {
+    if (!gameId) return;
+
+    const t = setInterval(async () => {
+      try {
+        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
+        setGame(j.game);
+      } catch {}
+    }, 900);
+
+    return () => clearInterval(t);
+  }, [gameId]);
+
   // restore session token
   useEffect(() => {
     if (!publicKey || !gameId) return;
@@ -150,55 +159,6 @@ export default function Page() {
     const t = localStorage.getItem(key);
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
-
-  // poll current game (serverSecondsLeft is the ONLY source of truth)
-  useEffect(() => {
-    if (!gameId) return;
-
-    const t = setInterval(async () => {
-      try {
-        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
-        const g = j.game;
-        setGame(g);
-
-        const ssl = Number(j.serverSecondsLeft);
-
-        if (g?.status === "PLAYING" && Number.isFinite(ssl) && ssl >= 0) {
-          // show immediately (no 3s/0s weirdness)
-          setSecondsLeft(Math.max(0, Math.floor(ssl)));
-
-          // smooth local countdown between polls
-          const nextLocalDeadline = Date.now() + Math.max(0, ssl) * 1000;
-
-          const prev = lastLocalDeadlineRef.current;
-          if (prev == null || Math.abs(prev - nextLocalDeadline) > 400) {
-            lastLocalDeadlineRef.current = nextLocalDeadline;
-            setLocalDeadlineAt(nextLocalDeadline);
-          }
-        } else {
-          lastLocalDeadlineRef.current = null;
-          setLocalDeadlineAt(null);
-          setSecondsLeft(0);
-        }
-      } catch {}
-    }, 900);
-
-    return () => clearInterval(t);
-  }, [gameId]);
-
-  // local ticking for smoothness (never decides the truth)
-  useEffect(() => {
-    if (!game || game.status !== "PLAYING" || !localDeadlineAt) return;
-
-    const tick = () => {
-      const remaining = Math.max(0, Math.ceil((localDeadlineAt - Date.now()) / 1000));
-      setSecondsLeft(remaining);
-    };
-
-    tick();
-    const interval = setInterval(tick, 200);
-    return () => clearInterval(interval);
-  }, [game?.status, localDeadlineAt]);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -243,12 +203,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
-      // optimistic display until /get poll returns real seconds
-      const assumed = Date.now() + 20_000;
-      lastLocalDeadlineRef.current = assumed;
-      setLocalDeadlineAt(assumed);
-      setSecondsLeft(20);
-
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -275,10 +229,6 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
-
-      setLocalDeadlineAt(null);
-      lastLocalDeadlineRef.current = null;
-      setSecondsLeft(0);
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -309,14 +259,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      // optimistic display until /get poll returns authoritative seconds
-      if (j.game?.status === "PLAYING") {
-        const assumed = Date.now() + 20_000;
-        lastLocalDeadlineRef.current = assumed;
-        setLocalDeadlineAt(assumed);
-        setSecondsLeft(20);
-      }
-
       toast.success("Joined game");
     } catch (e: any) {
       toast.dismiss();
@@ -338,17 +280,6 @@ export default function Page() {
       });
 
       setGame(j.game);
-
-      if (j.game?.status === "PLAYING") {
-        const assumed = Date.now() + 20_000;
-        lastLocalDeadlineRef.current = assumed;
-        setLocalDeadlineAt(assumed);
-        setSecondsLeft(20);
-      } else {
-        lastLocalDeadlineRef.current = null;
-        setLocalDeadlineAt(null);
-        setSecondsLeft(0);
-      }
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
@@ -695,14 +626,14 @@ export default function Page() {
                 </div>
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  Time left: <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b> (auto move at 0)
-                </div>
-
-                <div className="ttt-dim" style={{ fontSize: 12 }}>
                   Pot:{" "}
                   <b style={{ color: "rgba(255,255,255,.92)" }}>
                     {((game?.potLamports ?? 0) / 1e9).toFixed(4)} SOL
                   </b>
+                </div>
+
+                <div className="ttt-dim" style={{ fontSize: 12 }}>
+                  Auto-move after 20s of inactivity.
                 </div>
               </div>
 
@@ -711,9 +642,6 @@ export default function Page() {
                   setGameId(null);
                   setGame(null);
                   setSessionToken(null);
-                  setLocalDeadlineAt(null);
-                  lastLocalDeadlineRef.current = null;
-                  setSecondsLeft(0);
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
