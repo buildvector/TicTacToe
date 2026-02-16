@@ -6,8 +6,11 @@ import { PublicKey } from "@solana/web3.js";
 
 export const runtime = "nodejs";
 
+// ✅ CRITICAL: stop Vercel/Next from caching this GET route
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 const MOVE_MS = 20_000;
-const DEPLOY_MARK = "GET_ROUTE_FIX_TIMER_2026-02-16_v2";
 
 const LINES = [
   [0, 1, 2],
@@ -53,7 +56,7 @@ function applyTurnMove(g: any, index: number) {
     g.winnerPubkey = winnerPk;
     g.endedReason = "WIN";
     g.updatedAt = now();
-    return { ok: true, finished: true };
+    return { ok: true, finished: true, draw: false };
   }
 
   if (isFull(g.board)) {
@@ -70,7 +73,7 @@ function applyTurnMove(g: any, index: number) {
   g.turn = other(mark);
   g.deadlineAt = now() + MOVE_MS;
   g.updatedAt = now();
-  return { ok: true, finished: false };
+  return { ok: true, finished: false, draw: false };
 }
 
 async function acquireLock(key: string, seconds = 10) {
@@ -125,38 +128,34 @@ async function maybePayout(gameId: string, g: any) {
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const gameId = searchParams.get("gameId");
-  if (!gameId) return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
+  if (!gameId) {
+    return NextResponse.json({ error: "Missing gameId" }, { status: 400, headers: { "Cache-Control": "no-store" } });
+  }
 
   const g = await kv.get<any>(`game:${gameId}`);
-  if (!g) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (!g) {
+    return NextResponse.json({ error: "Not found" }, { status: 404, headers: { "Cache-Control": "no-store" } });
+  }
 
   let payoutSig: string | null = g.payoutSig ?? null;
-
   const serverNow = now();
 
-  // ✅ Hard-fix timer hvis den er “skæv”
+  // self-heal timer if missing/bad
   if (g.status === "PLAYING") {
     const d = Number(g.deadlineAt);
-    const remainingMs = Number.isFinite(d) ? d - serverNow : NaN;
-
-    const needsFix =
-      !Number.isFinite(d) ||
-      remainingMs <= 0 ||
-      remainingMs > MOVE_MS + 2_000 ||
-      remainingMs < 1_000; // hvis den nogensinde ligger helt nede ved få sekunder, reset
-
-    if (needsFix) {
+    if (!Number.isFinite(d) || d <= serverNow) {
       g.deadlineAt = serverNow + MOVE_MS;
       g.updatedAt = serverNow;
       await kv.set(`game:${gameId}`, g);
     }
   }
 
-  // auto-move på server
+  // auto-move if expired
   if (g.status === "PLAYING" && g.deadlineAt && serverNow > Number(g.deadlineAt)) {
     const idx = autoMoveIndex(g);
-    if (idx >= 0) applyTurnMove(g, idx);
-    else {
+    if (idx >= 0) {
+      applyTurnMove(g, idx);
+    } else {
       g.board = emptyBoard();
       g.moves = 0;
       g.turn = other(g.turn === "O" ? "O" : "X");
@@ -172,19 +171,28 @@ export async function GET(req: Request) {
     }
   }
 
-  const deadlineAt = g.status === "PLAYING" && g.deadlineAt ? Number(g.deadlineAt) : null;
+  const deadlineAt = g?.status === "PLAYING" && g?.deadlineAt ? Number(g.deadlineAt) : null;
   const serverSecondsLeft =
     deadlineAt && Number.isFinite(deadlineAt)
       ? Math.max(0, Math.ceil((deadlineAt - serverNow) / 1000))
       : 0;
 
-  return NextResponse.json({
-    ok: true,
-    DEPLOY_MARK,
-    game: g,
-    payoutSig,
-    serverNow,
-    deadlineAt,
-    serverSecondsLeft,
-  });
+  const DEPLOY_MARK = "GET_FORCE_DYNAMIC_2026-02-16";
+
+  return NextResponse.json(
+    {
+      ok: true,
+      game: g,
+      payoutSig,
+      serverNow,
+      serverSecondsLeft,
+      DEPLOY_MARK,
+    },
+    {
+      headers: {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+      },
+    }
+  );
 }
