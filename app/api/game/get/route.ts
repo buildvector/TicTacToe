@@ -8,6 +8,9 @@ export const runtime = "nodejs";
 
 const MOVE_MS = 20_000;
 
+// bump this any time you redeploy to verify prod is running the right code
+const DEPLOY_MARK = "GET_ROUTE_2026-02-16_1130";
+
 const LINES = [
   [0, 1, 2],
   [3, 4, 5],
@@ -47,11 +50,13 @@ function applyTurnMove(g: any, index: number) {
   const w = winnerOf(g.board);
   if (w) {
     const winnerPk = w === "X" ? g.xPlayer : g.oPlayer;
+
     g.status = "FINISHED";
     g.winner = w;
     g.winnerPubkey = winnerPk;
     g.endedReason = "WIN";
     g.updatedAt = now();
+
     return { ok: true, finished: true, draw: false };
   }
 
@@ -105,6 +110,7 @@ async function maybePayout(gameId: string, g: any) {
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
+  // history best-effort
   try {
     const item = {
       at: now(),
@@ -131,23 +137,21 @@ export async function GET(req: Request) {
 
   let payoutSig: string | null = g.payoutSig ?? null;
 
+  // use ONE clock for everything in this request
   const serverNow = now();
 
-  // ✅ Strong self-heal of timer
+  // ✅ Strong self-heal of timer, including the “3 seconds” case at game start
   if (g.status === "PLAYING") {
     const d = Number(g.deadlineAt);
     const moves = Number(g.moves ?? 0);
 
     const remainingMs = Number.isFinite(d) ? d - serverNow : NaN;
 
-    // Fix cases:
-    // - missing/invalid
-    // - expired or far in future
-    // - suspiciously short RIGHT after game start (moves === 0) => your “3 seconds” bug
     const needsFix =
       !Number.isFinite(d) ||
       remainingMs <= 0 ||
       remainingMs > MOVE_MS + 2_000 ||
+      // if moves==0 (just started) and remaining is suspiciously low (like 3s), fix it
       (moves === 0 && remainingMs < MOVE_MS - 2_000);
 
     if (needsFix) {
@@ -158,7 +162,7 @@ export async function GET(req: Request) {
   }
 
   // auto-move on server if deadline passed
-  if (g.status === "PLAYING" && g.deadlineAt && now() > Number(g.deadlineAt)) {
+  if (g.status === "PLAYING" && g.deadlineAt && serverNow > Number(g.deadlineAt)) {
     const idx = autoMoveIndex(g);
     if (idx >= 0) {
       applyTurnMove(g, idx);
@@ -166,8 +170,8 @@ export async function GET(req: Request) {
       g.board = emptyBoard();
       g.moves = 0;
       g.turn = other(g.turn === "O" ? "O" : "X");
-      g.deadlineAt = now() + MOVE_MS;
-      g.updatedAt = now();
+      g.deadlineAt = serverNow + MOVE_MS;
+      g.updatedAt = serverNow;
     }
 
     await kv.set(`game:${gameId}`, g);
@@ -178,8 +182,7 @@ export async function GET(req: Request) {
     }
   }
 
-  const deadlineAt =
-    g?.status === "PLAYING" && g?.deadlineAt ? Number(g.deadlineAt) : null;
+  const deadlineAt = g.status === "PLAYING" && g.deadlineAt ? Number(g.deadlineAt) : null;
 
   const serverSecondsLeft =
     deadlineAt && Number.isFinite(deadlineAt)
@@ -188,6 +191,7 @@ export async function GET(req: Request) {
 
   return NextResponse.json({
     ok: true,
+    deployMark: DEPLOY_MARK,
     game: g,
     payoutSig,
     serverNow,
