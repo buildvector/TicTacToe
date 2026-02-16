@@ -59,7 +59,6 @@ function applyTurnMove(g: any, index: number) {
   }
 
   if (isFull(g.board)) {
-    // draw => reset board and continue
     g.board = emptyBoard();
     g.moves = 0;
     g.draws = Number(g.draws ?? 0) + 1;
@@ -89,39 +88,27 @@ async function acquireLock(key: string, seconds = 10) {
 }
 
 async function maybePayout(gameId: string, g: any) {
-  if (g.status !== "FINISHED" || !g.winner) {
-    return { paid: false, sig: null as string | null };
-  }
-
-  if (g.payoutSig && g.winnerPubkey) {
-    return { paid: true, sig: g.payoutSig as string };
-  }
+  if (g.status !== "FINISHED" || !g.winner) return { paid: false, sig: null as string | null };
+  if (g.payoutSig && g.winnerPubkey) return { paid: true, sig: g.payoutSig as string };
 
   const locked = await acquireLock(`payoutlock:${gameId}`, 15);
   if (!locked) return { paid: false, sig: null };
 
   const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
-  if (fresh.payoutSig && fresh.winnerPubkey) {
-    return { paid: true, sig: fresh.payoutSig as string };
-  }
+  if (fresh.payoutSig && fresh.winnerPubkey) return { paid: true, sig: fresh.payoutSig as string };
 
-  const winnerPk =
-    fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
-
+  const winnerPk = fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
   fresh.winnerPubkey = winnerPk;
   fresh.endedReason = "WIN";
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
-  const sig = await payoutFromTreasury(
-    new PublicKey(winnerPk),
-    Number(fresh.potLamports)
-  );
-
+  const sig = await payoutFromTreasury(new PublicKey(winnerPk), Number(fresh.potLamports));
   fresh.payoutSig = sig;
   fresh.updatedAt = now();
   await kv.set(`game:${gameId}`, fresh);
 
+  // history best-effort
   try {
     const item = {
       at: now(),
@@ -141,19 +128,26 @@ async function maybePayout(gameId: string, g: any) {
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const gameId = searchParams.get("gameId");
-  if (!gameId) {
-    return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
-  }
+  if (!gameId) return NextResponse.json({ error: "Missing gameId" }, { status: 400 });
 
-  let g = await kv.get<any>(`game:${gameId}`);
-  if (!g) {
-    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  const g = await kv.get<any>(`game:${gameId}`);
+  if (!g) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+  let payoutSig: string | null = g.payoutSig ?? null;
+
+  // ✅ Self-heal: if game is PLAYING but deadlineAt is missing/bad -> reset to 20s
+  if (g.status === "PLAYING") {
+    const d = Number(g.deadlineAt);
+    if (!Number.isFinite(d) || d <= 0) {
+      g.deadlineAt = now() + MOVE_MS;
+      g.updatedAt = now();
+      await kv.set(`game:${gameId}`, g);
+    }
   }
 
   // auto-move on server if deadline passed
   if (g.status === "PLAYING" && g.deadlineAt && now() > Number(g.deadlineAt)) {
     const idx = autoMoveIndex(g);
-
     if (idx >= 0) {
       applyTurnMove(g, idx);
     } else {
@@ -166,19 +160,27 @@ export async function GET(req: Request) {
 
     await kv.set(`game:${gameId}`, g);
 
-    // if finished by auto-move => payout
     if (g.status === "FINISHED" && g.winner) {
-      await maybePayout(gameId, g);
+      const p = await maybePayout(gameId, g);
+      payoutSig = p.sig;
     }
-
-    // ✅ IMPORTANT: re-fetch to return the final authoritative state
-    g = (await kv.get<any>(`game:${gameId}`)) ?? g;
   }
+
+  // ✅ SERVER-TRUE timer (same clock as join/move)
+  const serverNow = now();
+  const deadlineAt =
+    g?.status === "PLAYING" && g?.deadlineAt ? Number(g.deadlineAt) : null;
+
+  const serverSecondsLeft =
+    deadlineAt && Number.isFinite(deadlineAt)
+      ? Math.max(0, Math.ceil((deadlineAt - serverNow) / 1000))
+      : 0;
 
   return NextResponse.json({
     ok: true,
     game: g,
-    payoutSig: g.payoutSig ?? null,
-    serverNow: now(),
+    payoutSig,
+    serverNow,
+    serverSecondsLeft,
   });
 }

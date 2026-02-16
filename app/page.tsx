@@ -70,11 +70,9 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ Robust timer: localDeadlineAt is computed from (deadlineAt - serverNow)
+  // ✅ Timer: driven by serverSecondsLeft (authoritative)
   const [localDeadlineAt, setLocalDeadlineAt] = useState<number | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
-
-  // keep last computed remaining so we don't jitter on small polling differences
   const lastLocalDeadlineRef = useRef<number | null>(null);
 
   useEffect(() => setMounted(true), []);
@@ -153,36 +151,34 @@ export default function Page() {
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
 
-  // poll current game
+  // poll current game (serverSecondsLeft is the ONLY source of truth)
   useEffect(() => {
     if (!gameId) return;
 
     const t = setInterval(async () => {
       try {
         const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
-
         const g = j.game;
-        const serverNow = Number(j.serverNow);
-
         setGame(g);
 
-        // ✅ Build a local deadline that matches server deadline without clock sync
-        if (g?.status === "PLAYING" && g?.deadlineAt && Number.isFinite(serverNow)) {
-          const deadlineAt = Number(g.deadlineAt);
-          if (Number.isFinite(deadlineAt)) {
-            const remainingMs = deadlineAt - serverNow; // server-time delta
-            const nextLocalDeadline = Date.now() + Math.max(0, remainingMs);
+        const ssl = Number(j.serverSecondsLeft);
 
-            // avoid jitter if polling causes +/- small ms differences
-            const prev = lastLocalDeadlineRef.current;
-            if (prev == null || Math.abs(prev - nextLocalDeadline) > 300) {
-              lastLocalDeadlineRef.current = nextLocalDeadline;
-              setLocalDeadlineAt(nextLocalDeadline);
-            }
+        if (g?.status === "PLAYING" && Number.isFinite(ssl) && ssl >= 0) {
+          // show immediately (no 3s/0s weirdness)
+          setSecondsLeft(Math.max(0, Math.floor(ssl)));
+
+          // smooth local countdown between polls
+          const nextLocalDeadline = Date.now() + Math.max(0, ssl) * 1000;
+
+          const prev = lastLocalDeadlineRef.current;
+          if (prev == null || Math.abs(prev - nextLocalDeadline) > 400) {
+            lastLocalDeadlineRef.current = nextLocalDeadline;
+            setLocalDeadlineAt(nextLocalDeadline);
           }
         } else {
           lastLocalDeadlineRef.current = null;
           setLocalDeadlineAt(null);
+          setSecondsLeft(0);
         }
       } catch {}
     }, 900);
@@ -190,12 +186,9 @@ export default function Page() {
     return () => clearInterval(t);
   }, [gameId]);
 
-  // countdown ticks locally against localDeadlineAt
+  // local ticking for smoothness (never decides the truth)
   useEffect(() => {
-    if (!game || game.status !== "PLAYING" || !localDeadlineAt) {
-      setSecondsLeft(0);
-      return;
-    }
+    if (!game || game.status !== "PLAYING" || !localDeadlineAt) return;
 
     const tick = () => {
       const remaining = Math.max(0, Math.ceil((localDeadlineAt - Date.now()) / 1000));
@@ -205,7 +198,7 @@ export default function Page() {
     tick();
     const interval = setInterval(tick, 200);
     return () => clearInterval(interval);
-  }, [game?.status, game?.updatedAt, localDeadlineAt]);
+  }, [game?.status, localDeadlineAt]);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -250,6 +243,12 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
+      // optimistic display until /get poll returns real seconds
+      const assumed = Date.now() + 20_000;
+      lastLocalDeadlineRef.current = assumed;
+      setLocalDeadlineAt(assumed);
+      setSecondsLeft(20);
+
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -276,8 +275,10 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
+
       setLocalDeadlineAt(null);
       lastLocalDeadlineRef.current = null;
+      setSecondsLeft(0);
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -308,13 +309,12 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      // best-effort: start local deadline immediately if join response has deadlineAt
-      if (j.game?.status === "PLAYING" && j.game?.deadlineAt) {
-        // We don't have serverNow here reliably, so we let /get fix it within 0.9s.
-        // But we can at least avoid flashing "0" by assuming remaining=20s:
+      // optimistic display until /get poll returns authoritative seconds
+      if (j.game?.status === "PLAYING") {
         const assumed = Date.now() + 20_000;
         lastLocalDeadlineRef.current = assumed;
         setLocalDeadlineAt(assumed);
+        setSecondsLeft(20);
       }
 
       toast.success("Joined game");
@@ -339,14 +339,15 @@ export default function Page() {
 
       setGame(j.game);
 
-      // after move, /get will recompute exact localDeadlineAt within 0.9s
       if (j.game?.status === "PLAYING") {
         const assumed = Date.now() + 20_000;
         lastLocalDeadlineRef.current = assumed;
         setLocalDeadlineAt(assumed);
+        setSecondsLeft(20);
       } else {
         lastLocalDeadlineRef.current = null;
         setLocalDeadlineAt(null);
+        setSecondsLeft(0);
       }
 
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
@@ -712,6 +713,7 @@ export default function Page() {
                   setSessionToken(null);
                   setLocalDeadlineAt(null);
                   lastLocalDeadlineRef.current = null;
+                  setSecondsLeft(0);
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
