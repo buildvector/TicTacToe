@@ -70,9 +70,9 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ SERVER-TRUE countdown (kun fra /api/game/get)
-  const [serverSecondsLeft, setServerSecondsLeft] = useState<number>(0);
-  const [serverNow, setServerNow] = useState<number | null>(null);
+  // ✅ SERVER timer (authoritative)
+  const [secondsLeft, setSecondsLeft] = useState<number>(0);
+  const [serverNow, setServerNow] = useState<number>(0);
 
   useEffect(() => setMounted(true), []);
 
@@ -142,7 +142,7 @@ export default function Page() {
     };
   }, []);
 
-  // ✅ Poll current game + server timer
+  // poll current game (and pull serverSecondsLeft)
   useEffect(() => {
     if (!gameId) return;
 
@@ -150,11 +150,26 @@ export default function Page() {
       try {
         const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
         setGame(j.game);
-        setServerSecondsLeft(Number(j.serverSecondsLeft ?? 0));
-        setServerNow(Number(j.serverNow ?? null));
-      } catch {}
-    }, 600);
 
+        // ✅ This is the truth: what the server believes is left
+        if (typeof j.serverSecondsLeft === "number") setSecondsLeft(j.serverSecondsLeft);
+        if (typeof j.serverNow === "number") setServerNow(j.serverNow);
+
+        if (j?.game?.status !== "PLAYING") {
+          setSecondsLeft(0);
+        }
+      } catch {}
+    }, 900);
+
+    return () => clearInterval(t);
+  }, [gameId]);
+
+  // local countdown display (only visual) based on serverSecondsLeft
+  useEffect(() => {
+    if (!gameId) return;
+    const t = setInterval(() => {
+      setSecondsLeft((s) => Math.max(0, s - 1));
+    }, 1000);
     return () => clearInterval(t);
   }, [gameId]);
 
@@ -209,8 +224,9 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
-      // reset timer display (will be updated by poll)
-      setServerSecondsLeft(0);
+      // reset timer display until get poll returns real value
+      setSecondsLeft(0);
+      setServerNow(0);
 
       toast.success("Game created");
     } catch (e: any) {
@@ -238,8 +254,8 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
-      setServerSecondsLeft(0);
-      setServerNow(null);
+      setSecondsLeft(0);
+      setServerNow(0);
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -270,8 +286,8 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      // reset timer display (will be updated by poll)
-      setServerSecondsLeft(0);
+      setSecondsLeft(0);
+      setServerNow(0);
 
       toast.success("Joined game");
     } catch (e: any) {
@@ -646,13 +662,11 @@ export default function Page() {
                   </b>
                 </div>
 
-                {/* ✅ Dette er den ENESTE timer vi viser */}
+                {/* ✅ This line proves where “3 seconds” is coming from */}
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
                   Auto-move in:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>
-                    {game?.status === "PLAYING" ? `${serverSecondsLeft}s` : "—"}
-                  </b>
-                  {serverNow ? <span style={{ opacity: 0.65 }}> · serverNow {String(serverNow).slice(0, 6)}…</span> : null}
+                  <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b>{" "}
+                  <span style={{ opacity: 0.7 }}>(serverNow: {serverNow || "—"})</span>
                 </div>
               </div>
 
@@ -661,8 +675,8 @@ export default function Page() {
                   setGameId(null);
                   setGame(null);
                   setSessionToken(null);
-                  setServerSecondsLeft(0);
-                  setServerNow(null);
+                  setSecondsLeft(0);
+                  setServerNow(0);
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
