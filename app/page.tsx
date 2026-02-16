@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
@@ -14,6 +14,8 @@ const FEE_BPS = 300;
 const BET_PRESETS_SOL = [0.1, 0.25, 0.5, 1] as const;
 const MIN_BET_SOL = 0.1;
 const MAX_BET_SOL = 5;
+
+const MOVE_SECONDS = 20; // ✅ UI timer (server bruger også 20s)
 
 const WalletMultiButton = dynamic(
   async () => (await import("@solana/wallet-adapter-react-ui")).WalletMultiButton,
@@ -70,8 +72,10 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // local ticking clock so timer display updates smoothly
-  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  // ✅ UI countdown
+  const [secondsLeft, setSecondsLeft] = useState<number>(0);
+  const lastTickAtRef = useRef<number>(0);
+  const lastUpdatedAtRef = useRef<number | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -117,7 +121,6 @@ export default function Page() {
     setHistory(hj.history ?? []);
   };
 
-  // poll lobby + history
   useEffect(() => {
     let alive = true;
 
@@ -156,13 +159,6 @@ export default function Page() {
     return () => clearInterval(t);
   }, [gameId]);
 
-  // ticking clock only when in-game (for timer UI)
-  useEffect(() => {
-    if (!gameId) return;
-    const t = setInterval(() => setNowMs(Date.now()), 250);
-    return () => clearInterval(t);
-  }, [gameId]);
-
   // restore session token
   useEffect(() => {
     if (!publicKey || !gameId) return;
@@ -170,6 +166,36 @@ export default function Page() {
     const t = localStorage.getItem(key);
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
+
+  // ✅ RESET UI TIMER når tur starter (updatedAt ændrer sig)
+  useEffect(() => {
+    if (!game) return;
+
+    if (game.status === "PLAYING") {
+      const u = Number(game.updatedAt ?? 0);
+      const prev = lastUpdatedAtRef.current;
+
+      // når der kommer et nyt "tick" fra server (move/auto-move/join), resetter vi timeren til 20
+      if (Number.isFinite(u) && u > 0 && (prev === null || u !== prev)) {
+        lastUpdatedAtRef.current = u;
+        setSecondsLeft(MOVE_SECONDS);
+        lastTickAtRef.current = Date.now();
+      }
+    } else {
+      setSecondsLeft(0);
+    }
+  }, [game?.status, game?.updatedAt]);
+
+  // ✅ UI countdown tick (ren visuel)
+  useEffect(() => {
+    const t = setInterval(() => {
+      setSecondsLeft((s) => {
+        if (s <= 0) return 0;
+        return Math.max(0, s - 1);
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -240,6 +266,8 @@ export default function Page() {
       setGameId(null);
       setGame(null);
       setSessionToken(null);
+      setSecondsLeft(0);
+      lastUpdatedAtRef.current = null;
     } catch (e: any) {
       toast.dismiss();
       toast.error(e?.message ?? "Error");
@@ -269,6 +297,9 @@ export default function Page() {
 
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
+
+      // UI timer starter når updatedAt ændrer sig, men vi nulstiller ref så den trigger sikkert
+      lastUpdatedAtRef.current = null;
 
       toast.success("Joined game");
     } catch (e: any) {
@@ -316,14 +347,6 @@ export default function Page() {
     const current = game.turn === "X" ? game.xPlayer : game.oPlayer;
     return current === me;
   }, [game, me]);
-
-  // ✅ REAL timer: computed from deadlineAt directly (no secondsLeft state)
-  const secondsLeft = useMemo(() => {
-    if (!game || game.status !== "PLAYING") return 0;
-    const d = Number(game.deadlineAt);
-    if (!Number.isFinite(d) || d <= 0) return 0;
-    return Math.max(0, Math.ceil((d - nowMs) / 1000));
-  }, [game, nowMs]);
 
   const cellSize = "clamp(72px, 22vw, 110px)";
 
@@ -652,8 +675,9 @@ export default function Page() {
                 </div>
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  Auto-move in{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b>.
+                  Auto-move after{" "}
+                  <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b>{" "}
+                  of inactivity.
                 </div>
               </div>
 
@@ -662,6 +686,8 @@ export default function Page() {
                   setGameId(null);
                   setGame(null);
                   setSessionToken(null);
+                  setSecondsLeft(0);
+                  lastUpdatedAtRef.current = null;
                 }}
                 className="btn-premium ring-violet-hover"
                 style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
