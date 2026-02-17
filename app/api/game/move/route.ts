@@ -1,7 +1,6 @@
-// app/api/game/move/route.ts
 import { NextResponse } from "next/server";
 import { kv } from "@/lib/kv";
-import { autoMoveIndex, emptyBoard } from "@/lib/game";
+import { applyMove, other } from "@/lib/game";
 import { payoutFromTreasury } from "@/lib/sol";
 import { PublicKey } from "@solana/web3.js";
 import { requireSession } from "@/lib/session";
@@ -9,82 +8,12 @@ import { nowMs } from "@/lib/clock";
 
 export const runtime = "nodejs";
 
-const MOVE_MS = 20_000;
-
-const LINES = [
-  [0, 1, 2],
-  [3, 4, 5],
-  [6, 7, 8],
-  [0, 3, 6],
-  [1, 4, 7],
-  [2, 5, 8],
-  [0, 4, 8],
-  [2, 4, 6],
-];
-
-function other(turn: "X" | "O") {
-  return turn === "X" ? "O" : "X";
-}
-
-function winnerOf(board: any[]): "X" | "O" | null {
-  for (const [a, b, c] of LINES) {
-    const v = board[a];
-    if (v && v === board[b] && v === board[c]) return v as "X" | "O";
-  }
-  return null;
-}
-
-function isFull(board: any[]) {
-  return board.every((x) => x === "X" || x === "O");
-}
-
-function applyTurnMove(g: any, index: number, ts: number) {
-  if (!Array.isArray(g.board) || g.board.length !== 9) g.board = emptyBoard();
-  if (index < 0 || index > 8) return { ok: false, error: "Bad index" };
-  if (g.board[index]) return { ok: false, error: "Cell occupied" };
-
-  const mark: "X" | "O" = g.turn === "O" ? "O" : "X";
-  g.board[index] = mark;
-  g.moves = Number(g.moves ?? 0) + 1;
-
-  const w = winnerOf(g.board);
-  if (w) {
-    const winnerPk = w === "X" ? g.xPlayer : g.oPlayer;
-    g.status = "FINISHED";
-    g.winner = w;
-    g.winnerPubkey = winnerPk;
-    g.endedReason = "WIN";
-    g.updatedAt = ts;
-    return { ok: true, finished: true, draw: false };
-  }
-
-  if (isFull(g.board)) {
-    g.board = emptyBoard();
-    g.moves = 0;
-    g.draws = Number(g.draws ?? 0) + 1;
-    g.status = "PLAYING";
-    g.turn = other(mark);
-    g.deadlineAt = ts + MOVE_MS;
-    g.updatedAt = ts;
-    return { ok: true, finished: false, draw: true };
-  }
-
-  g.turn = other(mark);
-  g.deadlineAt = ts + MOVE_MS;
-  g.updatedAt = ts;
-  return { ok: true, finished: false, draw: false };
-}
+// ✅ Turn timeout (ms). Keep in sync with join route.
+const MOVE_MS = Number(process.env.MOVE_MS ?? "90000");
 
 async function acquireLock(key: string, seconds = 10) {
-  try {
-    const r = await kv.set(key, "1", { nx: true, ex: seconds });
-    return !!r;
-  } catch {
-    const existing = await kv.get(key);
-    if (existing) return false;
-    await kv.set(key, "1", { ex: seconds });
-    return true;
-  }
+  const r = await kv.set(key, "1", { nx: true, ex: seconds });
+  return !!r;
 }
 
 async function maybePayout(gameId: string, g: any) {
@@ -97,9 +26,14 @@ async function maybePayout(gameId: string, g: any) {
   const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
   if (fresh.payoutSig && fresh.winnerPubkey) return { paid: true, sig: fresh.payoutSig as string };
 
-  const winnerPk = fresh.winnerPubkey || (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
+  const winnerPk =
+    fresh.winnerPubkey ||
+    (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
+
+  if (!winnerPk) return { paid: false, sig: null };
+
   fresh.winnerPubkey = winnerPk;
-  fresh.endedReason = "WIN";
+  fresh.endedReason = fresh.endedReason ?? "WIN";
   fresh.updatedAt = await nowMs();
   await kv.set(`game:${gameId}`, fresh);
 
@@ -110,12 +44,13 @@ async function maybePayout(gameId: string, g: any) {
 
   try {
     const item = {
-      at: await nowMs(),
+      at: Date.now(),
       gameId,
       betLamports: fresh.betLamports,
       winner: winnerPk,
       loser: winnerPk === fresh.createdBy ? fresh.joinedBy : fresh.createdBy,
       payoutSig: sig,
+      endedReason: fresh.endedReason ?? "WIN",
     };
     await kv.lpush("games:history", item);
     await kv.ltrim("games:history", 0, 9);
@@ -124,11 +59,78 @@ async function maybePayout(gameId: string, g: any) {
   return { paid: true, sig };
 }
 
+function ensureDeadline(g: any, serverNow: number) {
+  // If older game objects are missing timer fields, initialize once.
+  if (!Number.isFinite(Number(g.deadlineAt)) || Number(g.deadlineAt) <= 0) {
+    g.turnStartedAt = serverNow;
+    g.deadlineAt = serverNow + MOVE_MS;
+    g.moveMs = MOVE_MS;
+  }
+}
+
+function computeTimeoutWinner(g: any) {
+  // The player whose turn it currently is timed out -> other(turn) wins.
+  const winnerMark = other(g.turn);
+  const winnerPk = winnerMark === "X" ? g.xPlayer : g.oPlayer;
+  return { winnerMark, winnerPk };
+}
+
+async function applyTimeoutIfExpired(gameId: string, g: any, serverNow: number) {
+  ensureDeadline(g, serverNow);
+
+  const deadlineAt = Number(g.deadlineAt);
+  if (!Number.isFinite(deadlineAt) || deadlineAt <= 0) return { didTimeout: false };
+
+  if (serverNow <= deadlineAt) return { didTimeout: false };
+
+  // Already finished?
+  if (g.status === "FINISHED") return { didTimeout: true };
+
+  const locked = await acquireLock(`timeoutlock:${gameId}`, 15);
+  if (!locked) return { didTimeout: true };
+
+  const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
+  if (fresh.status === "FINISHED") return { didTimeout: true };
+
+  // Only timeout if still PLAYING
+  if (fresh.status !== "PLAYING") return { didTimeout: false };
+
+  ensureDeadline(fresh, serverNow);
+  const freshDeadline = Number(fresh.deadlineAt);
+  if (serverNow <= freshDeadline) return { didTimeout: false };
+
+  const { winnerMark, winnerPk } = computeTimeoutWinner(fresh);
+  if (!winnerPk) {
+    // Shouldn't happen, but don't brick state.
+    return { didTimeout: false };
+  }
+
+  fresh.status = "FINISHED";
+  fresh.winner = winnerMark;
+  fresh.winnerPubkey = winnerPk;
+  fresh.endedReason = "TIMEOUT";
+  fresh.updatedAt = serverNow;
+
+  await kv.set(`game:${gameId}`, fresh);
+
+  const p = await maybePayout(gameId, fresh);
+  const gg = (await kv.get<any>(`game:${gameId}`)) ?? fresh;
+
+  return { didTimeout: true, game: gg, payoutSig: p.sig ?? null };
+}
+
 export async function POST(req: Request) {
   try {
-    const { gameId, index, sessionToken } = await req.json();
+    const body = await req.json().catch(() => ({}));
 
-    if (!gameId || index === undefined || index === null || !sessionToken) {
+    const gameId = String(body?.gameId ?? "");
+    const sessionToken = String(body?.sessionToken ?? "");
+
+    // action: "MOVE" | "CLAIM"
+    const action = String(body?.action ?? "MOVE").toUpperCase();
+    const indexRaw = body?.index;
+
+    if (!gameId || !sessionToken) {
       return NextResponse.json({ error: "Bad input" }, { status: 400 });
     }
 
@@ -140,8 +142,7 @@ export async function POST(req: Request) {
     const g = await kv.get<any>(`game:${gameId}`);
     if (!g) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-    const ts = await nowMs();
-
+    // If already finished, just return
     if (g.status === "FINISHED") {
       return NextResponse.json({ ok: true, game: g, payoutSig: g.payoutSig ?? null });
     }
@@ -150,48 +151,78 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Not playing" }, { status: 400 });
     }
 
-    // Auto-move if deadline passed BEFORE checking turn (stable clock)
-    if (g.deadlineAt && ts > Number(g.deadlineAt)) {
-      const idx = autoMoveIndex(g);
-      if (idx >= 0) {
-        applyTurnMove(g, idx, ts);
-      } else {
-        g.board = emptyBoard();
-        g.moves = 0;
-        g.turn = other(g.turn === "O" ? "O" : "X");
-        g.deadlineAt = ts + MOVE_MS;
-        g.updatedAt = ts;
-      }
+    const serverNow = await nowMs();
+
+    // ✅ Always apply timeout check first (covers "first move never taken")
+    const t = await applyTimeoutIfExpired(gameId, g, serverNow);
+    if (t.didTimeout) {
+      // If timeout happened, return updated state.
+      return NextResponse.json({ ok: true, game: t.game ?? g, payoutSig: t.payoutSig ?? null, serverNowMs: serverNow });
     }
 
-    if (g.status === "FINISHED" && g.winner) {
-      await kv.set(`game:${gameId}`, g);
-      const p = await maybePayout(gameId, g);
+    // Ensure timer exists even on older games
+    ensureDeadline(g, serverNow);
+
+    // CLAIM action: user asks server to check timeout and award win if expired.
+    if (action === "CLAIM") {
+      // Not expired => reject
+      if (serverNow <= Number(g.deadlineAt)) {
+        return NextResponse.json({ error: "Not timed out yet" }, { status: 400 });
+      }
+
+      // Re-run (will timeout now)
+      const t2 = await applyTimeoutIfExpired(gameId, g, serverNow);
       const gg = (await kv.get<any>(`game:${gameId}`)) ?? g;
-      return NextResponse.json({ ok: true, game: gg, payoutSig: p.sig });
+      return NextResponse.json({ ok: true, game: gg, payoutSig: t2.payoutSig ?? null, serverNowMs: serverNow });
+    }
+
+    // MOVE action
+    if (action !== "MOVE") {
+      return NextResponse.json({ error: "Bad action" }, { status: 400 });
+    }
+
+    if (indexRaw === undefined || indexRaw === null) {
+      return NextResponse.json({ error: "Missing index" }, { status: 400 });
+    }
+
+    const index = Number(indexRaw);
+    if (!Number.isFinite(index)) {
+      return NextResponse.json({ error: "Bad index" }, { status: 400 });
     }
 
     const currentPlayer = g.turn === "X" ? g.xPlayer : g.oPlayer;
     if (currentPlayer !== playerPubkey) {
-      await kv.set(`game:${gameId}`, g);
       return NextResponse.json({ error: "Not your turn" }, { status: 400 });
     }
 
-    const res = applyTurnMove(g, Number(index), ts);
+    const res = applyMove(g, index);
     if (!res.ok) {
       await kv.set(`game:${gameId}`, g);
       return NextResponse.json({ error: res.error }, { status: 400 });
     }
 
-    await kv.set(`game:${gameId}`, g);
-
+    // If winner, set winnerPubkey before payout
     if (g.status === "FINISHED" && g.winner) {
+      g.winnerPubkey = g.winner === "X" ? g.xPlayer : g.oPlayer;
+      g.endedReason = g.endedReason ?? "WIN";
+      g.updatedAt = await nowMs();
+      await kv.set(`game:${gameId}`, g);
+
       const p = await maybePayout(gameId, g);
       const gg = (await kv.get<any>(`game:${gameId}`)) ?? g;
-      return NextResponse.json({ ok: true, game: gg, payoutSig: p.sig });
+      return NextResponse.json({ ok: true, game: gg, payoutSig: p.sig, serverNowMs: await nowMs() });
     }
 
-    return NextResponse.json({ ok: true, game: g });
+    // ✅ Successful move: restart timer for next turn
+    const ts = await nowMs();
+    g.turnStartedAt = ts;
+    g.deadlineAt = ts + MOVE_MS;
+    g.moveMs = MOVE_MS;
+    g.updatedAt = ts;
+
+    await kv.set(`game:${gameId}`, g);
+
+    return NextResponse.json({ ok: true, game: g, serverNowMs: ts });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Server error" }, { status: 500 });
   }

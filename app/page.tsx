@@ -15,7 +15,6 @@ const BET_PRESETS_SOL = [0.1, 0.25, 0.5, 1] as const;
 const MIN_BET_SOL = 0.1;
 const MAX_BET_SOL = 5;
 
-const MOVE_SECONDS = 20; // server = 20s
 const WalletMultiButton = dynamic(
   async () => (await import("@solana/wallet-adapter-react-ui")).WalletMultiButton,
   { ssr: false }
@@ -26,10 +25,16 @@ function net(lamports: number) {
 }
 
 async function fetchJson(url: string, init?: RequestInit) {
-  const res = await fetch(url, {
+  const u = url.includes("?") ? `${url}&_=${Date.now()}` : `${url}?_=${Date.now()}`;
+
+  const res = await fetch(u, {
     ...init,
     cache: "no-store",
-    headers: { ...(init?.headers || {}), "cache-control": "no-store" },
+    headers: {
+      ...(init?.headers || {}),
+      "Cache-Control": "no-store",
+      Pragma: "no-cache",
+    },
   });
 
   const text = await res.text();
@@ -76,11 +81,11 @@ export default function Page() {
 
   const [sessionToken, setSessionToken] = useState<string | null>(null);
 
-  // ✅ Server-authoritative timer display
-  const [secondsLeft, setSecondsLeft] = useState<number>(0);
+  // Stable UI time offset: serverNowMs - clientNowMs
+  const [serverOffsetMs, setServerOffsetMs] = useState<number>(0);
 
-  // Used only for fallback if serverSecondsLeft is missing
-  const lastSeenDeadlineRef = useRef<number | null>(null);
+  // Avoid overlapping polls
+  const pollingRef = useRef(false);
 
   useEffect(() => setMounted(true), []);
 
@@ -117,15 +122,16 @@ export default function Page() {
   };
 
   const refreshLobby = async () => {
-    const j = await fetchJson("/api/game/list?t=" + Date.now());
+    const j = await fetchJson("/api/game/list");
     setLobby(j.games ?? []);
   };
 
   const refreshHistory = async () => {
-    const hj = await fetchJson("/api/game/history?t=" + Date.now());
+    const hj = await fetchJson("/api/game/history");
     setHistory(hj.history ?? []);
   };
 
+  // lobby/history polling (always)
   useEffect(() => {
     let alive = true;
 
@@ -150,48 +156,55 @@ export default function Page() {
     };
   }, []);
 
-  // poll current game (pull serverSecondsLeft)
-  useEffect(() => {
-    if (!gameId) return;
-
-    const t = setInterval(async () => {
-      try {
-        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}&t=${Date.now()}`);
-
-        setGame(j.game);
-
-        // ✅ BEST: serverSecondsLeft
-        if (typeof j.serverSecondsLeft === "number") {
-          const v = Math.max(0, Math.min(MOVE_SECONDS, Math.floor(j.serverSecondsLeft)));
-          setSecondsLeft(v);
-        } else {
-          // fallback: compute from deadlineAt (client clock) but clamp hard
-          const d = Number(j?.game?.deadlineAt);
-          if (Number.isFinite(d) && d > 0) {
-            lastSeenDeadlineRef.current = d;
-            const s = Math.ceil((d - Date.now()) / 1000);
-            const v = Math.max(0, Math.min(MOVE_SECONDS, s));
-            setSecondsLeft(v);
-          } else {
-            setSecondsLeft(0);
-          }
-        }
-      } catch {
-        // if fetch fails, don't keep showing stale 3s
-        setSecondsLeft((prev) => Math.max(0, Math.min(MOVE_SECONDS, prev)));
-      }
-    }, 700);
-
-    return () => clearInterval(t);
-  }, [gameId]);
-
-  // restore session token
+  // restore session token for current game
   useEffect(() => {
     if (!publicKey || !gameId) return;
     const key = sessionKey(publicKey.toBase58(), gameId);
     const t = localStorage.getItem(key);
     if (t) setSessionToken(t);
   }, [publicKey, gameId]);
+
+  // Poll current game
+  useEffect(() => {
+    if (!gameId) return;
+
+    let alive = true;
+
+    const tick = async () => {
+      if (!alive) return;
+      if (pollingRef.current) return;
+      pollingRef.current = true;
+
+      try {
+        const j = await fetchJson(`/api/game/get?gameId=${encodeURIComponent(gameId)}`);
+        setGame(j.game ?? null);
+
+        if (typeof j.serverNowMs === "number") {
+          // Stable offset; don't overreact to small jitter
+          const off = j.serverNowMs - Date.now();
+          setServerOffsetMs((prev) => {
+            // Smooth: clamp jumps to reduce visual bouncing
+            const diff = off - prev;
+            if (Math.abs(diff) <= 250) return off;
+            // If big jump, blend a bit
+            return prev + Math.sign(diff) * 250;
+          });
+        }
+      } catch {
+        // keep last
+      } finally {
+        pollingRef.current = false;
+      }
+    };
+
+    tick();
+    const t = setInterval(tick, 900);
+
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [gameId]);
 
   async function payToTreasury(lamports: number) {
     if (!publicKey) throw new Error("Connect wallet");
@@ -236,9 +249,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), j.gameId), j.sessionToken);
 
-      setSecondsLeft(0);
-      lastSeenDeadlineRef.current = null;
-
       toast.success("Game created");
     } catch (e: any) {
       toast.dismiss();
@@ -251,25 +261,23 @@ export default function Page() {
       if (!publicKey) return toast.error("Connect wallet first");
 
       const tok = sessionToken || localStorage.getItem(sessionKey(publicKey.toBase58(), id));
-      if (!tok) return toast.error("Missing session (refresh → re-create/join)");
+      if (!tok) return toast.error("Missing session (refresh → re-create)");
 
-      toast.loading("Refunding 97%...");
-      await fetchJson("/api/game/leave", {
+      toast.loading("Canceling + refunding 97%...");
+      const j = await fetchJson("/api/game/leave", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ gameId: id, sessionToken: tok }),
       });
-
       toast.dismiss();
-      toast.success("Canceled + refunded");
-      setGameId(null);
-      setGame(null);
-      setSessionToken(null);
-      setSecondsLeft(0);
-      lastSeenDeadlineRef.current = null;
+
+      if (j?.refundSig) toast.success("Refund sent ✅");
+      else toast.success("Canceled ✅");
+
+      setGame(j.game ?? null);
     } catch (e: any) {
       toast.dismiss();
-      toast.error(e?.message ?? "Error");
+      toast.error(e?.message ?? "Cancel failed");
     }
   }
 
@@ -297,9 +305,6 @@ export default function Page() {
       setSessionToken(j.sessionToken);
       localStorage.setItem(sessionKey(publicKey.toBase58(), id), j.sessionToken);
 
-      setSecondsLeft(0);
-      lastSeenDeadlineRef.current = null;
-
       toast.success("Joined game");
     } catch (e: any) {
       toast.dismiss();
@@ -317,18 +322,44 @@ export default function Page() {
       const j = await fetchJson("/api/game/move", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gameId, index: i, sessionToken: tok }),
+        body: JSON.stringify({ gameId, index: i, sessionToken: tok, action: "MOVE" }),
       });
 
       setGame(j.game);
 
-      // timer kommer fra /get poll, så intet lokalt reset her
       if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
         const win = j.game.winnerPubkey === publicKey.toBase58();
         toast.success(win ? "You Win 🏆" : "You Lose 😭");
       }
     } catch (e: any) {
       toast.error(e?.message ?? "Move error");
+    }
+  }
+
+  async function claimTimeout() {
+    try {
+      if (!publicKey || !gameId) return;
+
+      const tok = sessionToken || localStorage.getItem(sessionKey(publicKey.toBase58(), gameId));
+      if (!tok) return toast.error("Missing session (refresh → re-join)");
+
+      toast.loading("Claiming timeout…");
+      const j = await fetchJson("/api/game/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gameId, sessionToken: tok, action: "CLAIM" }),
+      });
+      toast.dismiss();
+
+      setGame(j.game);
+
+      if (j.game?.status === "FINISHED" && j.game?.winnerPubkey) {
+        const win = j.game.winnerPubkey === publicKey.toBase58();
+        toast.success(win ? "Timeout win 🏆" : "Timeout loss 😭");
+      }
+    } catch (e: any) {
+      toast.dismiss();
+      toast.error(e?.message ?? "Claim failed");
     }
   }
 
@@ -348,7 +379,31 @@ export default function Page() {
     return current === me;
   }, [game, me]);
 
+  const canCancelInsideGame =
+    !!game &&
+    game.status === "LOBBY" &&
+    !!me &&
+    String(game.createdBy) === me &&
+    !game.joinedBy;
+
+  const showBackToLobby = !!game && game.status === "FINISHED";
+
   const cellSize = "clamp(72px, 22vw, 110px)";
+
+  // ✅ Stable countdown using server offset
+  const deadlineAt = Number(game?.deadlineAt ?? 0);
+  const moveMs = Number(game?.moveMs ?? 90000);
+  const nowStable = Date.now() + serverOffsetMs;
+  const msLeft = deadlineAt > 0 ? Math.max(0, deadlineAt - nowStable) : 0;
+  const secondsLeft = deadlineAt > 0 ? Math.ceil(msLeft / 1000) : 0;
+
+  // ✅ You can claim win if opponent's turn has expired
+  const canClaim =
+    !!game &&
+    game.status === "PLAYING" &&
+    !!me &&
+    deadlineAt > 0 &&
+    nowStable > deadlineAt;
 
   return (
     <main className="bg-casino">
@@ -356,16 +411,30 @@ export default function Page() {
 
       <div className="casino-wrap ttt-container">
         {/* Header */}
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 16,
+            flexWrap: "wrap",
+            alignItems: "flex-start",
+          }}
+        >
           <div style={{ display: "grid", gap: 6, maxWidth: 640 }}>
             <div style={{ fontSize: 30, fontWeight: 700, letterSpacing: -0.2 }}>Tic Tac Toe</div>
             <div className="ttt-dim" style={{ fontSize: 13 }}>
               Premium P2P tic-tac-toe. Both players deposit to the same pot. Winner paid out server-side.
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>3% fee / deposit</span>
-              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>Refund 97%</span>
-              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>No house edge</span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>
+                3% fee / deposit
+              </span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>
+                Turn timer: {Math.round(moveMs / 1000)}s
+              </span>
+              <span className="ttt-item" style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12 }}>
+                No house edge
+              </span>
             </div>
           </div>
 
@@ -385,7 +454,9 @@ export default function Page() {
                       Deposit goes to the pot. <span style={{ color: "rgba(255,255,255,.85)" }}>3%</span> fee is taken instantly.
                     </div>
                   </div>
-                  <div className="ttt-dim" style={{ fontSize: 12 }}>min {MIN_BET_SOL} SOL</div>
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    min {MIN_BET_SOL} SOL
+                  </div>
                 </div>
 
                 {/* Bet buttons */}
@@ -415,7 +486,9 @@ export default function Page() {
                           }}
                         >
                           <div style={{ fontSize: 13, fontWeight: 800 }}>{x} SOL</div>
-                          <div style={{ fontSize: 12, opacity: active ? 0.75 : 0.6 }}>{active ? "Selected" : "Click to select"}</div>
+                          <div style={{ fontSize: 12, opacity: active ? 0.75 : 0.6 }}>
+                            {active ? "Selected" : "Click to select"}
+                          </div>
                         </button>
                       );
                     })}
@@ -431,7 +504,13 @@ export default function Page() {
                         onChange={(e) => setCustom(e.target.value)}
                         placeholder={`e.g. ${MIN_BET_SOL}`}
                         className="input-premium"
-                        style={{ flex: 1, borderRadius: 14, padding: "12px 14px", outline: "none", color: "rgba(255,255,255,.92)" }}
+                        style={{
+                          flex: 1,
+                          borderRadius: 14,
+                          padding: "12px 14px",
+                          outline: "none",
+                          color: "rgba(255,255,255,.92)",
+                        }}
                       />
 
                       <button
@@ -462,23 +541,37 @@ export default function Page() {
                 {/* Breakdown */}
                 <div className="ttt-mt18 ttt-item ttt-itemPad" style={{ alignItems: "stretch", gap: 14, flexDirection: "column" }}>
                   <div className="ttt-row">
-                    <div className="ttt-dim" style={{ fontSize: 12 }}>Fee (3%)</div>
-                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>{(feeLamports / 1e9).toFixed(6)} SOL</div>
+                    <div className="ttt-dim" style={{ fontSize: 12 }}>
+                      Fee (3%)
+                    </div>
+                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>
+                      {(feeLamports / 1e9).toFixed(6)} SOL
+                    </div>
                   </div>
 
                   <div className="ttt-row">
-                    <div className="ttt-dim" style={{ fontSize: 12 }}>Pot (after fee)</div>
-                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>{(potLamports / 1e9).toFixed(6)} SOL</div>
+                    <div className="ttt-dim" style={{ fontSize: 12 }}>
+                      Pot (after fee)
+                    </div>
+                    <div className="mono" style={{ fontWeight: 800, fontSize: 12 }}>
+                      {(potLamports / 1e9).toFixed(6)} SOL
+                    </div>
                   </div>
 
                   <div style={{ height: 1, background: "rgba(255,255,255,0.10)" }} />
 
                   <div className="ttt-row">
-                    <div className="ttt-dim" style={{ fontSize: 12 }}>Potential payout</div>
-                    <div className="mono" style={{ fontWeight: 900, fontSize: 12 }}>{((potLamports * 2) / 1e9).toFixed(6)} SOL</div>
+                    <div className="ttt-dim" style={{ fontSize: 12 }}>
+                      Potential payout
+                    </div>
+                    <div className="mono" style={{ fontWeight: 900, fontSize: 12 }}>
+                      {((potLamports * 2) / 1e9).toFixed(6)} SOL
+                    </div>
                   </div>
 
-                  <div className="ttt-dim" style={{ fontSize: 12 }}>Winner receives both pots (2×). No house edge.</div>
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    Winner receives both pots (2×). No house edge.
+                  </div>
                 </div>
 
                 {/* CTA */}
@@ -501,7 +594,9 @@ export default function Page() {
                     Create & deposit
                   </button>
 
-                  <div className="ttt-dim" style={{ fontSize: 12 }}>You will sign a transfer in Phantom.</div>
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    You will sign a transfer in Phantom.
+                  </div>
                 </div>
               </section>
 
@@ -510,7 +605,9 @@ export default function Page() {
                 <div className="ttt-row">
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 800 }}>Last 10 games</div>
-                    <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>Global recent payouts</div>
+                    <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>
+                      Global recent payouts
+                    </div>
                   </div>
 
                   <button
@@ -523,7 +620,13 @@ export default function Page() {
                       }
                     }}
                     className="btn-premium ring-violet-hover"
-                    style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
+                    style={{
+                      borderRadius: 14,
+                      padding: "10px 14px",
+                      fontWeight: 900,
+                      color: "rgba(255,255,255,0.92)",
+                      cursor: "pointer",
+                    }}
                   >
                     Refresh
                   </button>
@@ -538,10 +641,14 @@ export default function Page() {
                         <div style={{ fontWeight: 800 }}>{h.gameId}</div>
                         <div className="ttt-dim" style={{ fontSize: 12, marginTop: 2 }}>
                           winner{" "}
-                          <span className="mono" style={{ color: "rgba(255,255,255,.9)" }}>{short(String(h.winner))}</span> · bet{" "}
-                          {(Number(h.betLamports) / 1e9).toFixed(4)} SOL
+                          <span className="mono" style={{ color: "rgba(255,255,255,.9)" }}>
+                            {short(String(h.winner))}
+                          </span>{" "}
+                          · bet {(Number(h.betLamports) / 1e9).toFixed(4)} SOL
                         </div>
-                        <div className="ttt-dim" style={{ fontSize: 12 }}>sig {String(h.payoutSig).slice(0, 10)}…</div>
+                        <div className="ttt-dim" style={{ fontSize: 12 }}>
+                          sig {String(h.payoutSig).slice(0, 10)}…
+                        </div>
                       </div>
 
                       <div style={{ flexShrink: 0 }}>
@@ -565,7 +672,9 @@ export default function Page() {
                             View tx
                           </a>
                         ) : (
-                          <span className="ttt-dim" style={{ fontSize: 12 }}>—</span>
+                          <span className="ttt-dim" style={{ fontSize: 12 }}>
+                            —
+                          </span>
                         )}
                       </div>
                     </div>
@@ -579,7 +688,9 @@ export default function Page() {
               <div className="ttt-row">
                 <div>
                   <div style={{ fontSize: 14, fontWeight: 800 }}>Open games</div>
-                  <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>Join an open game. Deposit goes to the pot.</div>
+                  <div className="ttt-dim" style={{ fontSize: 12, marginTop: 4 }}>
+                    Join an open game. Deposit goes to the pot.
+                  </div>
                 </div>
 
                 <button
@@ -592,13 +703,21 @@ export default function Page() {
                     }
                   }}
                   className="btn-premium ring-violet-hover"
-                  style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
+                  style={{
+                    borderRadius: 14,
+                    padding: "10px 14px",
+                    fontWeight: 900,
+                    color: "rgba(255,255,255,0.92)",
+                    cursor: "pointer",
+                  }}
                 >
                   Refresh
                 </button>
               </div>
 
-              <div className="ttt-mt12 ttt-dim" style={{ fontSize: 12 }}>{lobby.length} open</div>
+              <div className="ttt-mt12 ttt-dim" style={{ fontSize: 12 }}>
+                {lobby.length} open
+              </div>
 
               <div className="ttt-mt12" style={{ display: "grid", gap: 10 }}>
                 {lobby.length === 0 && <div className="ttt-dim" style={{ fontSize: 13 }}>No open games.</div>}
@@ -633,16 +752,6 @@ export default function Page() {
                       >
                         Join
                       </button>
-
-                      {me && g.createdBy === me && (
-                        <button
-                          onClick={() => cancelGame(g.id)}
-                          className="btn-premium ring-violet-hover"
-                          style={{ borderRadius: 14, padding: "10px 12px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
-                        >
-                          Cancel
-                        </button>
-                      )}
                     </div>
                   </div>
                 ))}
@@ -654,46 +763,116 @@ export default function Page() {
         {/* In-game */}
         {inGame && (
           <section className="glass glass-rim glass-noise ttt-mt26" style={{ borderRadius: 24, padding: 16 }}>
-            <div className="ttt-row" style={{ flexWrap: "wrap" }}>
+            <div className="ttt-row" style={{ flexWrap: "wrap", alignItems: "flex-start" }}>
               <div style={{ display: "grid", gap: 6 }}>
                 <div>
-                  <span className="ttt-dim" style={{ fontSize: 12 }}>Game</span>{" "}
-                  <span className="mono" style={{ fontWeight: 900 }}>{gameId}</span>
+                  <span className="ttt-dim" style={{ fontSize: 12 }}>
+                    Game
+                  </span>{" "}
+                  <span className="mono" style={{ fontWeight: 900 }}>
+                    {gameId}
+                  </span>
                 </div>
 
-                <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  You are: <b style={{ color: "rgba(255,255,255,.92)" }}>{myMark ?? "spectator"}</b> · Turn:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{game?.turn ?? "-"}</b> · Your turn:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{myTurn ? "YES" : "NO"}</b>
-                </div>
+                {game?.status === "LOBBY" && (
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    Waiting for opponent to join…
+                  </div>
+                )}
+
+                {game?.status === "PLAYING" && (
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    You are: <b style={{ color: "rgba(255,255,255,.92)" }}>{myMark ?? "spectator"}</b> · Turn:{" "}
+                    <b style={{ color: "rgba(255,255,255,.92)" }}>{game?.turn ?? "-"}</b> · Your turn:{" "}
+                    <b style={{ color: "rgba(255,255,255,.92)" }}>{myTurn ? "YES" : "NO"}</b>
+                  </div>
+                )}
 
                 <div className="ttt-dim" style={{ fontSize: 12 }}>
                   Pot:{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>
-                    {((game?.potLamports ?? 0) / 1e9).toFixed(4)} SOL
-                  </b>
+                  <b style={{ color: "rgba(255,255,255,.92)" }}>{((game?.potLamports ?? 0) / 1e9).toFixed(4)} SOL</b>
                 </div>
 
-                <div className="ttt-dim" style={{ fontSize: 12 }}>
-                  Auto-move after{" "}
-                  <b style={{ color: "rgba(255,255,255,.92)" }}>{secondsLeft}s</b>{" "}
-                  of inactivity.
-                </div>
+                {game?.status === "PLAYING" && deadlineAt > 0 && (
+                  <div className="ttt-dim" style={{ fontSize: 12 }}>
+                    Turn expires in:{" "}
+                    <b style={{ color: secondsLeft <= 10 ? "rgba(252,165,165,0.95)" : "rgba(255,255,255,.92)" }}>
+                      {secondsLeft}s
+                    </b>
+                  </div>
+                )}
+
+                {/* ✅ Claim win if timeout */}
+                {game?.status === "PLAYING" && canClaim && (
+                  <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <button
+                      onClick={claimTimeout}
+                      className="ring-violet-hover"
+                      style={{
+                        borderRadius: 14,
+                        padding: "10px 14px",
+                        fontWeight: 900,
+                        border: "1px solid rgba(255,255,255,0.18)",
+                        background: "rgba(255,255,255,0.92)",
+                        color: "#0a0a0a",
+                        boxShadow: "0 16px 50px rgba(0,0,0,0.45)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Claim win (timeout)
+                    </button>
+                    <span className="ttt-dim" style={{ fontSize: 12 }}>
+                      If opponent didn’t move in time.
+                    </span>
+                  </div>
+                )}
+
+                {/* ✅ Cancel inside game view (only while LOBBY + creator + no joiner) */}
+                {canCancelInsideGame && (
+                  <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => cancelGame(gameId!)}
+                      className="ring-violet-hover"
+                      style={{
+                        borderRadius: 14,
+                        padding: "10px 14px",
+                        fontWeight: 900,
+                        border: "1px solid rgba(255,255,255,0.18)",
+                        background: "rgba(255,255,255,0.92)",
+                        color: "#0a0a0a",
+                        boxShadow: "0 16px 50px rgba(0,0,0,0.45)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Cancel & refund 97%
+                    </button>
+                    <span className="ttt-dim" style={{ fontSize: 12 }}>
+                      (only before someone joins)
+                    </span>
+                  </div>
+                )}
               </div>
 
-              <button
-                onClick={() => {
-                  setGameId(null);
-                  setGame(null);
-                  setSessionToken(null);
-                  setSecondsLeft(0);
-                  lastSeenDeadlineRef.current = null;
-                }}
-                className="btn-premium ring-violet-hover"
-                style={{ borderRadius: 14, padding: "10px 14px", fontWeight: 900, color: "rgba(255,255,255,0.92)", cursor: "pointer" }}
-              >
-                Back to lobby
-              </button>
+              {/* ✅ Back to lobby ONLY when finished */}
+              {showBackToLobby && (
+                <button
+                  onClick={() => {
+                    setGameId(null);
+                    setGame(null);
+                    setSessionToken(null);
+                  }}
+                  className="btn-premium ring-violet-hover"
+                  style={{
+                    borderRadius: 14,
+                    padding: "10px 14px",
+                    fontWeight: 900,
+                    color: "rgba(255,255,255,0.92)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Back to lobby
+                </button>
+              )}
             </div>
 
             <div
@@ -722,7 +901,7 @@ export default function Page() {
             {game?.status === "FINISHED" && (
               <div className="ttt-mt18 ttt-item">
                 <b>{game?.winnerPubkey === me ? "You Win 🏆" : "You Lose 😭"}</b>
-                <div className="ttt-dim" style={{ fontSize: 12 }}>Click “Back to lobby”.</div>
+                <div className="ttt-dim" style={{ fontSize: 12 }}>Now you can press “Back to lobby”.</div>
               </div>
             )}
           </section>

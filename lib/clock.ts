@@ -6,12 +6,11 @@ import { kv } from "@/lib/kv";
  * Uses Redis TIME if available (Upstash), fallback to Date.now().
  */
 export async function nowMs(): Promise<number> {
-  // 1) Upstash Redis client often has `.time()`
   try {
     const anyKv = kv as any;
 
     if (typeof anyKv.time === "function") {
-      const t = await anyKv.time(); // usually [seconds, microseconds] as strings
+      const t = await anyKv.time(); // [seconds, microseconds]
       const sec = Number(t?.[0]);
       const micro = Number(t?.[1]);
       if (Number.isFinite(sec) && Number.isFinite(micro)) {
@@ -19,7 +18,6 @@ export async function nowMs(): Promise<number> {
       }
     }
 
-    // 2) Some clients expose sendCommand(["TIME"])
     if (typeof anyKv.sendCommand === "function") {
       const t = await anyKv.sendCommand(["TIME"]);
       const sec = Number(t?.[0]);
@@ -29,7 +27,7 @@ export async function nowMs(): Promise<number> {
       }
     }
   } catch {
-    // ignore -> fallback
+    // ignore
   }
 
   return Date.now();

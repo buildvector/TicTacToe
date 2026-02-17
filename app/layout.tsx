@@ -1,23 +1,11 @@
-"use client";
 import "./globals.css";
-import { useMemo } from "react";
-import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
-import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
-import { PhantomWalletAdapter } from "@solana/wallet-adapter-wallets";
-
-import "@solana/wallet-adapter-react-ui/styles.css";
+import Providers from "./providers";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const endpoint = process.env.NEXT_PUBLIC_SOLANA_RPC!;
-  const wallets = useMemo(() => [new PhantomWalletAdapter()], []);
   return (
     <html lang="da">
       <body>
-        <ConnectionProvider endpoint={endpoint}>
-          <WalletProvider wallets={wallets} autoConnect={false}>
-            <WalletModalProvider>{children}</WalletModalProvider>
-          </WalletProvider>
-        </ConnectionProvider>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

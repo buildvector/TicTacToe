@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { kv } from "@/lib/kv";
-import { now, emptyBoard, Game } from "@/lib/game";
+import { emptyBoard, Game } from "@/lib/game";
 import { netAfterFee } from "@/lib/sol";
 import { createSession, bindSessionToGame } from "@/lib/session";
 import { verifyTreasuryTransferOrThrow } from "@/lib/payment";
@@ -10,11 +10,11 @@ export const runtime = "nodejs";
 
 const TREASURY = process.env.NEXT_PUBLIC_TREASURY_PUBKEY!;
 
-// Use whatever you already have, fallback to devnet if none provided.
 const RPC_URL =
   process.env.NEXT_PUBLIC_RPC_URL ||
   process.env.SOLANA_RPC_URL ||
   process.env.NEXT_PUBLIC_SOLANA_RPC_URL ||
+  process.env.NEXT_PUBLIC_SOLANA_RPC ||
   "https://api.devnet.solana.com";
 
 function makeId() {
@@ -63,34 +63,25 @@ async function paymentUsed(sig: string) {
 }
 
 async function markPaymentUsed(usedKey: string) {
-  // TTL 1 hour
   await kv.set(usedKey, 1, { ex: 60 * 60 });
 }
 
-/**
- * If frontend doesn't send paymentSig, try to find the matching recent
- * treasury transfer (same from/to/lamports) and reuse verifyTreasuryTransferOrThrow.
- */
 async function findRecentMatchingPaymentSig(args: {
   creatorPubkey: string;
   lamports: number;
 }): Promise<string | null> {
   const connection = new Connection(RPC_URL, "confirmed");
-
   const treasuryPk = new PublicKey(TREASURY);
 
-  // Pull recent signatures touching treasury. Keep limit modest for speed.
   const sigs = await connection.getSignaturesForAddress(treasuryPk, { limit: 25 });
 
   for (const s of sigs) {
     const sig = s.signature;
 
-    // Anti-replay: skip if already used
     const { used } = await paymentUsed(sig);
     if (used) continue;
 
     try {
-      // Will throw if not exact transfer match
       await verifyTreasuryTransferOrThrow({
         paymentSig: sig,
         fromPubkey: args.creatorPubkey,
@@ -100,7 +91,6 @@ async function findRecentMatchingPaymentSig(args: {
 
       return sig;
     } catch {
-      // Not a match; keep searching
       continue;
     }
   }
@@ -115,14 +105,12 @@ export async function POST(req: Request) {
     const creatorPubkey = pickCreatorPubkey(body);
     const betLamports = pickBetLamports(body);
 
-    // paymentSig may be missing in your current frontend
     let paymentSig = pickPaymentSig(body);
 
     if (!creatorPubkey || !betLamports) {
       return NextResponse.json({ error: "Bad input" }, { status: 400 });
     }
 
-    // If paymentSig wasn't provided, try to auto-detect it from recent treasury txs.
     if (!paymentSig) {
       paymentSig = await findRecentMatchingPaymentSig({
         creatorPubkey,
@@ -131,20 +119,15 @@ export async function POST(req: Request) {
 
       if (!paymentSig) {
         return NextResponse.json(
-          {
-            error:
-              "Missing paymentSig and no matching recent treasury transfer found. Try again (or refresh) after Phantom confirms.",
-          },
+          { error: "Missing paymentSig and no matching recent treasury transfer found." },
           { status: 400 }
         );
       }
     }
 
-    // Anti-replay: ensure paymentSig not used before
     const { usedKey, used } = await paymentUsed(paymentSig);
     if (used) return NextResponse.json({ error: "Payment already used" }, { status: 400 });
 
-    // Verify on-chain payment
     await verifyTreasuryTransferOrThrow({
       paymentSig,
       fromPubkey: creatorPubkey,
@@ -152,11 +135,10 @@ export async function POST(req: Request) {
       lamports: Number(betLamports),
     });
 
-    // Mark payment used
     await markPaymentUsed(usedKey);
 
+    const ts = Date.now();
     const id = makeId();
-    const seed = `${now()}_${Math.random()}_${creatorPubkey}`;
 
     const g: Game = {
       id,
@@ -164,18 +146,23 @@ export async function POST(req: Request) {
       createdBy: creatorPubkey,
       potLamports: netAfterFee(Number(betLamports)), // 97%
       status: "LOBBY",
+
       board: emptyBoard(),
       turn: "X",
-      createdAt: now(),
-      updatedAt: now(),
-      seed,
+
+      createdAt: ts,
+      updatedAt: ts,
       moves: 0,
+
+      // xPlayer/oPlayer sættes først ved join
+      xPlayer: undefined,
+      oPlayer: undefined,
+      joinedBy: undefined,
     };
 
     await kv.set(`game:${id}`, g);
-    await kv.zadd("games:lobby", { score: now(), member: id });
+    await kv.zadd("games:lobby", { score: ts, member: id });
 
-    // Session token (for moves without signing)
     const sessionToken = await createSession(creatorPubkey);
     await bindSessionToGame(sessionToken, id);
 

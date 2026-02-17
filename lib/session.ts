@@ -4,7 +4,6 @@ import { kv } from "@/lib/kv";
 const SESSION_TTL_SEC = 60 * 30; // 30 min
 
 function randToken() {
-  // browser-safe random-ish token for server-side use
   return `st_${Math.random().toString(36).slice(2)}${Math.random()
     .toString(36)
     .slice(2)}${Date.now().toString(36)}`;
@@ -13,7 +12,6 @@ function randToken() {
 export type Session = {
   pubkey: string;
   createdAt: number;
-  // Optional binding to a game (useful for moves)
   gameId?: string;
 };
 
@@ -45,6 +43,9 @@ export async function requireSession(token: string, gameId?: string) {
   if (gameId && s.gameId && s.gameId !== gameId) {
     return { ok: false as const, error: "Session not valid for this game" };
   }
+
+  // ✅ Sliding TTL: keep session alive while actively used
+  await kv.set(`session:${token}`, s, { ex: SESSION_TTL_SEC });
 
   return { ok: true as const, session: s };
 }
