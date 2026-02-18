@@ -1,36 +1,74 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# PvP TicTacToe ⚡
 
-## Getting Started
+Minimal on-chain PvP TicTacToe built on Solana.
 
-First, run the development server:
+Simple mechanics. Competitive play. Clean execution.
+
+## Live
+
+https://pvptictactoe.vercel.app/
+
+---
+
+## Preview
+
+![PvP TicTacToe – Game Interface](Screenshot.png)
+
+---
+
+## Overview
+
+PvP TicTacToe is a real-time two-player game built on Solana.
+
+Players connect their wallets, join a match, and compete in a classic TicTacToe format with transparent game state handling.
+
+The focus:
+
+- Clear game logic
+- Deterministic outcomes
+- Minimal UI
+- Permissionless participation
+
+No unnecessary complexity.
+
+---
+
+## Features
+
+- Real-time PvP gameplay
+- Wallet integration (Phantom)
+- Transparent move validation
+- Automatic win detection
+- Clean minimal interface
+- Fast game reset
+
+---
+
+## How It Works
+
+1. Player creates or joins a game
+2. Players alternate turns
+3. Moves are validated
+4. Win or draw is determined automatically
+5. Game resets for next round
+
+Flow:
+
+Client → Wallet → Game state → Validation → UI update
+
+---
+
+## Stack
+
+- Next.js
+- TypeScript
+- Solana Web3.js
+- Vercel
+
+---
+
+## Run Locally
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
