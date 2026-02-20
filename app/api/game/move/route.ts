@@ -23,7 +23,33 @@ async function acquireLock(key: string, seconds = 10) {
   return !!r;
 }
 
+async function hasMarker(key: string) {
+  const v = await kv.get<string>(key);
+  return !!v;
+}
+
+async function setMarker(key: string, seconds: number) {
+  await kv.set(key, "1", { ex: seconds });
+}
+
 type SolarenaResult = "win" | "play" | "loss";
+
+function noStore(res: NextResponse) {
+  res.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.headers.set("Pragma", "no-cache");
+  return res;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, ms = 6000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 async function postSolarenaEvent(params: {
   wallet: string;
@@ -34,54 +60,136 @@ async function postSolarenaEvent(params: {
   payoutSig?: string | null;
   role: "winner" | "loser";
 }) {
-  try {
-    if (!params.wallet) return;
+  if (!params.wallet) return { ok: false, status: 0, body: "missing wallet" };
 
-    // Only post if key exists (local dev OK too – you have it in .env.local)
-    if (!SOLARENA_GAME_KEY) {
-      console.log("[ttt] SOLARENA_GAME_KEY missing -> skip posting", params.result);
-      return;
-    }
-
-    // allow 0 for loser if you ever want, but for volume fairness we typically want >0
-    if (!Number.isFinite(params.amountSol) || params.amountSol < 0) {
-      console.log("[ttt] amountSol invalid -> skip posting", params.amountSol);
-      return;
-    }
-
-    const res = await fetch(SOLARENA_MATCH_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-game-key": SOLARENA_GAME_KEY,
-      },
-      body: JSON.stringify({
-        wallet: params.wallet,
-        game: "ttt",
-        result: params.result,
-        amountSol: params.amountSol,
-        // meta used for debugging + dedupe on solarena-web side
-        meta: JSON.stringify({
-          source: "ttt",
-          gameId: params.gameId,
-          reason: params.reason,
-          role: params.role,
-          payoutSig: params.payoutSig ?? null,
-        }),
-      }),
+  if (!SOLARENA_GAME_KEY) {
+    console.log("[ttt] SOLARENA_GAME_KEY missing -> skip posting", {
+      result: params.result,
+      role: params.role,
     });
+    return { ok: false, status: 0, body: "missing key" };
+  }
+
+  if (!Number.isFinite(params.amountSol) || params.amountSol < 0) {
+    console.log("[ttt] amountSol invalid -> skip posting", params.amountSol);
+    return { ok: false, status: 0, body: "bad amountSol" };
+  }
+
+  const payload = {
+    wallet: params.wallet,
+    game: "ttt",
+    result: params.result,
+    amountSol: params.amountSol,
+    meta: JSON.stringify({
+      source: "ttt",
+      gameId: params.gameId,
+      reason: params.reason,
+      role: params.role,
+      payoutSig: params.payoutSig ?? null,
+    }),
+  };
+
+  console.log("[ttt] -> post /api/match", {
+    url: SOLARENA_MATCH_URL,
+    wallet: params.wallet,
+    result: params.result,
+    role: params.role,
+    amountSol: params.amountSol,
+  });
+
+  try {
+    const res = await fetchWithTimeout(
+      SOLARENA_MATCH_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-game-key": SOLARENA_GAME_KEY,
+        },
+        body: JSON.stringify(payload),
+      },
+      8000
+    );
 
     const txt = await res.text().catch(() => "");
-    console.log(`[ttt] posted ${params.result}/${params.role} ->`, res.status, txt.slice(0, 200));
+    console.log(`[ttt] <- /api/match ${params.result}/${params.role}`, res.status, txt.slice(0, 200));
+
+    return { ok: res.ok, status: res.status, body: txt };
   } catch (e: any) {
-    console.log("[ttt] failed to post event", e?.message ?? e);
+    console.log("[ttt] /api/match fetch failed", e?.name, e?.message ?? e);
+    return { ok: false, status: 0, body: String(e?.message ?? e) };
   }
 }
 
-function noStore(res: NextResponse) {
-  res.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  res.headers.set("Pragma", "no-cache");
-  return res;
+/**
+ * Post once per gameId, but ONLY mark posted when it actually succeeded.
+ * Also add a short backoff lock so polling doesn't spam Solarena.
+ */
+async function maybePostSolarenaOnce(gameId: string, g: any, payoutSig: string | null) {
+  const postedKey = `solarena:posted:${gameId}`;
+  const tryLockKey = `solarena:trylock:${gameId}`;
+
+  // already posted successfully
+  if (await hasMarker(postedKey)) return;
+
+  // short backoff so repeated calls don't spam while match endpoint is failing
+  const canTry = await acquireLock(tryLockKey, 15);
+  if (!canTry) return;
+
+  const winnerPk =
+    String(g.winnerPubkey || "") ||
+    String(g.winner === "X" ? g.xPlayer : g.oPlayer);
+
+  const loserPk =
+    winnerPk === String(g.createdBy) ? String(g.joinedBy ?? "") : String(g.createdBy ?? "");
+
+  const potSol = Number(g.potLamports ?? 0) / LAMPORTS_PER_SOL;
+  const betSol = Number(g.betLamports ?? 0) / LAMPORTS_PER_SOL;
+
+  // If these are weirdly 0, log it – payout can still succeed with lamports but we'd like to know
+  console.log("[ttt] maybePostSolarenaOnce", {
+    gameId,
+    winnerPk,
+    loserPk,
+    potSol,
+    betSol,
+    endedReason: g.endedReason,
+    hasKey: !!SOLARENA_GAME_KEY,
+  });
+
+  // winner win event
+  const w = await postSolarenaEvent({
+    wallet: winnerPk,
+    result: "win",
+    amountSol: potSol,
+    gameId,
+    reason: String(g.endedReason ?? "WIN"),
+    payoutSig,
+    role: "winner",
+  });
+
+  // loser play event (volume+participation)
+  const l = await postSolarenaEvent({
+    wallet: loserPk,
+    result: "play",
+    amountSol: betSol,
+    gameId,
+    reason: String(g.endedReason ?? "WIN"),
+    payoutSig,
+    role: "loser",
+  });
+
+  // Mark as posted ONLY if both calls succeeded (2xx)
+  if (w.ok && l.ok) {
+    await setMarker(postedKey, 60 * 60 * 24 * 7); // 7 days
+    console.log("[ttt] solarena posted OK -> marked", postedKey);
+  } else {
+    console.log("[ttt] solarena post NOT ok -> will retry later", {
+      winner: { ok: w.ok, status: w.status },
+      loser: { ok: l.ok, status: l.status },
+    });
+    // no marker => next call can retry (but tryLock prevents spamming)
+  }
 }
 
 async function maybePayout(gameId: string, g: any) {
@@ -92,11 +200,15 @@ async function maybePayout(gameId: string, g: any) {
   if (!locked) return { paid: false, sig: null };
 
   const fresh = (await kv.get<any>(`game:${gameId}`)) ?? g;
-  if (fresh.payoutSig && fresh.winnerPubkey) return { paid: true, sig: fresh.payoutSig as string };
+  if (fresh.payoutSig && fresh.winnerPubkey) {
+    // Payout already happened elsewhere; try posting (with payoutSig known)
+    await maybePostSolarenaOnce(gameId, fresh, fresh.payoutSig as string);
+    return { paid: true, sig: fresh.payoutSig as string };
+  }
 
   const winnerPk =
-    fresh.winnerPubkey ||
-    (fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
+    String(fresh.winnerPubkey || "") ||
+    String(fresh.winner === "X" ? fresh.xPlayer : fresh.oPlayer);
 
   if (!winnerPk) return { paid: false, sig: null };
 
@@ -106,54 +218,21 @@ async function maybePayout(gameId: string, g: any) {
   fresh.updatedAt = await nowMs();
   await kv.set(`game:${gameId}`, fresh);
 
-  // determine loser wallet
-  const loserPk =
-    winnerPk === String(fresh.createdBy) ? String(fresh.joinedBy ?? "") : String(fresh.createdBy ?? "");
-
-  // amount logic:
-  // - winner gets pot volume (the payout volume)
-  // - loser gets bet volume (so volume is fair / not all on winner)
-  const potSol = Number(fresh.potLamports ?? 0) / LAMPORTS_PER_SOL;
-  const betSol = Number(fresh.betLamports ?? 0) / LAMPORTS_PER_SOL;
-
-  // ✅ Dedup lock so we only post once even if multiple routes reach payout
-  const posted = await acquireLock(`solarena:posted:${gameId}`, 60 * 60);
-  if (posted) {
-    // winner: win
-    if (winnerPk && potSol > 0) {
-      await postSolarenaEvent({
-        wallet: winnerPk,
-        result: "win",
-        amountSol: potSol,
-        gameId,
-        reason: String(fresh.endedReason ?? "WIN"),
-        payoutSig: null,
-        role: "winner",
-      });
-    }
-
-    // loser: play (counts as volume + participation)
-    if (loserPk && betSol > 0) {
-      await postSolarenaEvent({
-        wallet: loserPk,
-        result: "play",
-        amountSol: betSol,
-        gameId,
-        reason: String(fresh.endedReason ?? "WIN"),
-        payoutSig: null,
-        role: "loser",
-      });
-    }
-  }
-
-  // payout
+  // payout first (so we can include payoutSig in solarena meta)
   const sig = await payoutFromTreasury(new PublicKey(winnerPk), Number(fresh.potLamports));
+
   fresh.payoutSig = sig;
   fresh.updatedAt = await nowMs();
   await kv.set(`game:${gameId}`, fresh);
 
+  // Now post (idempotent + retries)
+  await maybePostSolarenaOnce(gameId, fresh, sig);
+
   // optional: store history
   try {
+    const loserPk =
+      winnerPk === String(fresh.createdBy) ? String(fresh.joinedBy ?? "") : String(fresh.createdBy ?? "");
+
     const item = {
       at: Date.now(),
       gameId,
@@ -215,7 +294,6 @@ async function applyTimeoutIfExpired(gameId: string, g: any, serverNow: number) 
 
   await kv.set(`game:${gameId}`, fresh);
 
-  // ✅ No posting here anymore — handled once inside maybePayout (single source of truth)
   const p = await maybePayout(gameId, fresh);
   const gg = (await kv.get<any>(`game:${gameId}`)) ?? fresh;
 
@@ -313,7 +391,7 @@ export async function POST(req: Request) {
       return noStore(NextResponse.json({ error: res.error }, { status: 400 }));
     }
 
-    // If winner -> payout (and posting) happens inside maybePayout
+    // If winner -> payout + leaderboard post
     if (g.status === "FINISHED" && g.winner) {
       g.winnerPubkey = g.winner === "X" ? g.xPlayer : g.oPlayer;
       g.endedReason = g.endedReason ?? "WIN";
